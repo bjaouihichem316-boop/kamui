@@ -153,25 +153,25 @@ class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
             _divider(),
             const SizedBox(height: 14),
 
-            // Stats
+            // Stats (Simulated Telemetry)
             _statRow(icon: Icons.wifi, label: 'SAM Status',
                 value: _connectionStatus,
                 color: _isLive ? emeraldGlow : textMid),
             const SizedBox(height: 10),
             _statRow(icon: Icons.arrow_downward, label: 'Inbound Tunnels',
-                value: '$_inboundTunnels active', color: cyberCyan),
+                value: '$_inboundTunnels active (Simulated)', color: cyberCyan),
             const SizedBox(height: 10),
             _statRow(icon: Icons.arrow_upward, label: 'Outbound Tunnels',
-                value: '$_outboundTunnels active', color: cyberCyan),
+                value: '$_outboundTunnels active (Simulated)', color: cyberCyan),
             const SizedBox(height: 16),
             _divider(),
             const SizedBox(height: 14),
 
             // Bandwidth meters
             Text(
-              'BANDWIDTH',
+              'BANDWIDTH (SIMULATED TELEMETRY)',
               style: GoogleFonts.jetBrainsMono(
-                fontSize: 10, color: textDim, letterSpacing: 3,
+                fontSize: 10, color: textDim, letterSpacing: 2,
               ),
             ),
             const SizedBox(height: 10),

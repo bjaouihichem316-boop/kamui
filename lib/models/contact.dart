@@ -23,6 +23,9 @@ class Contact {
   /// Full I2P base64 destination key (516+ characters).
   final String destination;
 
+  /// Optional X25519 identity public key (Base64) for E2EE session agreement.
+  final String? identityPublicKey;
+
   /// Single character initial for the avatar display.
   final String avatarInitial;
 
@@ -33,6 +36,7 @@ class Contact {
     required this.id,
     required this.name,
     required this.destination,
+    this.identityPublicKey,
     required this.avatarInitial,
     this.status = ContactStatus.offline,
     this.lastSeen,
@@ -49,6 +53,7 @@ class Contact {
     String? id,
     String? name,
     String? destination,
+    String? identityPublicKey,
     String? avatarInitial,
     ContactStatus? status,
     DateTime? lastSeen,
@@ -57,6 +62,7 @@ class Contact {
       id: id ?? this.id,
       name: name ?? this.name,
       destination: destination ?? this.destination,
+      identityPublicKey: identityPublicKey ?? this.identityPublicKey,
       avatarInitial: avatarInitial ?? this.avatarInitial,
       status: status ?? this.status,
       lastSeen: lastSeen ?? this.lastSeen,

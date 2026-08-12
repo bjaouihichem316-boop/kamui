@@ -37,9 +37,11 @@ dependencies:
   # ─── Secure Key Storage ───────────────────────────
   flutter_secure_storage: ^9.2.4
 
-  # ─── Cryptography (AES-256-GCM message encryption)
+  # ─── Cryptography (AES-256-GCM message encryption, X25519 & SHA-256)
   pointycastle: ^3.9.1
   convert: ^3.1.2
+  crypto: ^3.0.3
+  cryptography: ^2.7.0
 
 dev_dependencies:
   flutter_test:

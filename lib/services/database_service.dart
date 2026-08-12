@@ -1,6 +1,11 @@
 import 'dart:async';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
+import 'identity_key_service.dart';
+import 'notification_service.dart';
+import 'session_manager.dart';
 
 /// Manages the SQLite database lifecycle for Kamui.
 ///
@@ -102,11 +107,36 @@ class DatabaseService {
     );
   }
 
-  /// Deletes and reinitializes the database (Panic / Duress wipe).
+  /// Complete Panic / Duress Nuke: purges SQLite DB, SecureStorage, OS notifications, cache files, and in-memory key sessions.
   Future<void> nuke() async {
+    // 1. Close & delete SQLite database
     final path = join(await getDatabasesPath(), _dbName);
     await close();
     await deleteDatabase(path);
+
+    // 2. Delete all secure keys from FlutterSecureStorage
+    try {
+      const storage = FlutterSecureStorage(
+        aOptions: AndroidOptions(encryptedSharedPreferences: true),
+        iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+      );
+      await storage.deleteAll();
+    } catch (_) {}
+
+    // 3. Cancel all active OS notifications
+    await NotificationService().cancelAllNotifications();
+
+    // 4. Reset in-memory cryptographic sessions & identity keys
+    SessionManager().reset();
+    await IdentityKeyService().clearKeys();
+
+    // 5. Clear application cache directory
+    try {
+      final tempDir = await getTemporaryDirectory();
+      if (await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
+    } catch (_) {}
   }
 
   /// Closes the database connection.

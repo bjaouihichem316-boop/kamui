@@ -12,8 +12,10 @@ import '../repositories/message_repository.dart';
 import '../repositories/message_repository_impl.dart';
 import '../services/crypto_service.dart';
 import '../services/database_service.dart';
+import '../services/identity_key_service.dart';
 import '../services/notification_service.dart';
 import '../services/sam_service.dart';
+import '../services/session_manager.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INFRASTRUCTURE PROVIDERS
@@ -22,6 +24,16 @@ import '../services/sam_service.dart';
 /// Singleton [CryptoService]. Must be initialized in main() before use.
 final cryptoServiceProvider = Provider<CryptoService>((ref) {
   return CryptoService();
+});
+
+/// Singleton [IdentityKeyService].
+final identityKeyServiceProvider = Provider<IdentityKeyService>((ref) {
+  return IdentityKeyService();
+});
+
+/// Singleton [SessionManager].
+final sessionManagerProvider = Provider<SessionManager>((ref) {
+  return SessionManager();
 });
 
 /// Singleton [DatabaseService].
@@ -58,14 +70,14 @@ class PersonaNotifier extends Notifier<Persona> {
       name:           'Ghost Persona',
       destinationKey: 'k8x9mQ3pAzRfT7vWsL2nJhDcYbXuE5oP1gKiNqVmBw4j6F8d0eCrZlOyH3m2p',
       avatarInitial:  'G',
-      tag:            'Primary Identity',
+      tag:            'Primary Stealth',
     ),
     Persona(
       id:             'p2',
-      name:           'Work Relay Node',
-      destinationKey: 'a7f3kRxMpLsW9nZqTvYcBdUeHoJi2gN4FmXwV6K8jD0P1rAyCbE5lQ9c1k',
+      name:           'Work Channel',
+      destinationKey: 'w9y0nR4qBzSgU8xXtM3oKiEdZcYvF6pQ2hLjOrWnCx5k7G9e1fDsAmPzI4n3q',
       avatarInitial:  'W',
-      tag:            'Encrypted Ops',
+      tag:            'Encrypted Work',
     ),
     Persona(
       id:             'p3',
@@ -81,10 +93,11 @@ class PersonaNotifier extends Notifier<Persona> {
 
   List<Persona> get availablePersonas => _mockPersonas;
 
-  void selectPersona(Persona persona) {
+  Future<void> selectPersona(Persona persona) async {
     state = persona;
-    // Update local destination key in SAM service
-    ref.read(samServiceProvider).localDestinationKey = persona.destinationKey;
+    final sam = ref.read(samServiceProvider);
+    sam.localDestinationKey = persona.destinationKey;
+    await sam.switchPersonaSession(persona.id);
   }
 }
 
@@ -106,22 +119,18 @@ class NeonThemeNotifier extends Notifier<NeonTheme> {
   }
 
   Future<void> _loadFromPrefs() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final idx   = prefs.getInt(_prefKey);
-      if (idx != null && idx >= 0 && idx < NeonTheme.values.length) {
-        state = NeonTheme.values[idx];
-      }
-    } catch (_) {}
+    final prefs = await SharedPreferences.getInstance();
+    final idx   = prefs.getInt(_prefKey) ?? 0;
+    state = NeonTheme.values[idx % NeonTheme.values.length];
   }
 
-  Future<void> setTheme(NeonTheme theme) async {
+  Future<void> selectTheme(NeonTheme theme) async {
     state = theme;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt(_prefKey, theme.index);
-    } catch (_) {}
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_prefKey, theme.index);
   }
+
+  Future<void> setTheme(NeonTheme theme) => selectTheme(theme);
 }
 
 final neonThemeNotifierProvider =
@@ -157,7 +166,8 @@ final samIncomingStreamProvider = StreamProvider<Map<String, String>>((ref) {
 
 /// Background listener for incoming peer messages with Native Notification.
 final incomingMessageListenerProvider = Provider<void>((ref) {
-  final crypto = ref.watch(cryptoServiceProvider);
+  // Messages are stored encrypted at rest — decryption happens at display time.
+  // CryptoService is intentionally not called here to avoid plaintext in memory.
 
   ref.listen<AsyncValue<Map<String, String>>>(
     samIncomingStreamProvider,
@@ -167,7 +177,8 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
 
       final senderDest       = data['from'] ?? '';
       final encryptedPayload = data['payload'] ?? '';
-      final decryptedText    = crypto.decrypt(encryptedPayload) ?? encryptedPayload;
+      // decryptedText intentionally not computed here — notifications are masked,
+      // and messages are stored encrypted at rest (decrypted on display).
 
       final conversations = ref.read(conversationsProvider).valueOrNull ?? [];
       Conversation? targetConv;
@@ -201,10 +212,12 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
         await ref.read(conversationsProvider.notifier).addAndPersist(targetConv);
       }
 
+      // Store the encrypted wire payload in DB — never plaintext-at-rest.
+      // decryptedText is only used transiently for in-memory display logic.
       final incomingMsg = Message(
         id:             'msg_in_${DateTime.now().millisecondsSinceEpoch}',
         conversationId: targetConv.id,
-        text:           decryptedText,
+        text:           encryptedPayload,   // Encrypted at rest — decrypted on read
         timestamp:      DateTime.now(),
         isSent:         false,
         isEncrypted:    true,
@@ -215,8 +228,8 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
           .addAndPersist(incomingMsg);
 
       await NotificationService().showMessageNotification(
-        senderName:  targetConv.contact.name,
-        messageText: decryptedText,
+        title: 'Encrypted Message Received',
+        body:  'New Secure Payload',
       );
     },
   );

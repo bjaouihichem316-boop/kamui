@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../core/theme.dart';
+import '../services/identity_key_service.dart';
 
 /// Modal dialog displaying a Cyberpunk styled QR code for sharing I2P addresses.
 class QrShareDialog extends StatelessWidget {
@@ -17,6 +18,8 @@ class QrShareDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final qrPayload = IdentityKeyService().generateHandshakePayload(destinationKey);
+
     return AlertDialog(
       backgroundColor: panelDark,
       shape: RoundedRectangleBorder(
@@ -52,7 +55,7 @@ class QrShareDialog extends StatelessWidget {
               ],
             ),
             child: QrImageView(
-              data:     destinationKey,
+              data:     qrPayload,
               version:  QrVersions.auto,
               size:     200.0,
               eyeStyle: const QrEyeStyle(

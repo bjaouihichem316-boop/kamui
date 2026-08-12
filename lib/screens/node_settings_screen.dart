@@ -611,18 +611,20 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
                   ),
                 ),
                 child: ListTile(
-                  onTap: () {
-                    ref.read(personaNotifierProvider.notifier).selectPersona(persona);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        backgroundColor: panelDark,
-                        duration: const Duration(seconds: 2),
-                        content: Text(
-                          'Switched persona to: ${persona.name}',
-                          style: GoogleFonts.jetBrainsMono(color: cyberCyan, fontSize: 11),
+                  onTap: () async {
+                    await ref.read(personaNotifierProvider.notifier).selectPersona(persona);
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          backgroundColor: panelDark,
+                          duration: const Duration(seconds: 2),
+                          content: Text(
+                            'Rotated SAM session for: ${persona.name}',
+                            style: GoogleFonts.jetBrainsMono(color: cyberCyan, fontSize: 11),
+                          ),
                         ),
-                      ),
-                    );
+                      );
+                    }
                   },
                   leading: CircleAvatar(
                     backgroundColor: isSelected ? vortexOrange : panelDark,

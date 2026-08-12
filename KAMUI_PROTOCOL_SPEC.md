@@ -1,0 +1,176 @@
+# Kamui Protocol Specification (v2.0.0-draft)
+**Protocol-First Architecture for End-to-End Encrypted Peer-to-Peer Messaging**
+
+---
+
+## Abstract
+
+Kamui v2 introduces a zero-trust, metadata-minimizing **Protocol-First Architecture** designed for high-assurance peer-to-peer messaging over anonymous overlay networks (specifically I2P SAM). This specification defines the cryptographic foundations, key agreement mechanisms, message ratcheting state machine, encapsulated envelope wire format, and OS notification boundary isolation guarantees.
+
+---
+
+## 1. Identity & Cryptographic Primitives
+
+Kamui v2 relies on modern, misuse-resistant cryptographic primitives:
+
+| Cryptographic Primitive | Implementation / Curve | Security Target |
+| :--- | :--- | :--- |
+| **Long-Term Identity Key (`IK`)** | Ed25519 (Signing) / X25519 (DH) | Peer Authentication & Identity |
+| **Signed Prekey (`SPK`)** | X25519 | Asynchronous Authentication |
+| **One-Time Prekey (`OPK`)** | X25519 | Forward Secrecy during Handshake |
+| **Ephemeral Key (`EK`)** | X25519 | Per-Session / Per-Ratchet DH |
+| **Symmetric Encryption** | AES-256-GCM / ChaCha20-Poly1305 | Authenticated Encryption with Associated Data (AEAD) |
+| **Key Derivation Function (KDF)** | HKDF-SHA256 (RFC 5869) | State progression & key extraction |
+
+### 1.1 Long-Term Identity Keys (`IK`)
+- Each Kamui node maintains an Ed25519 long-term identity keypair `(IK_priv, IK_pub)`.
+- For Diffie-Hellman operations, `IK_pub` is converted to Curve25519 (`IK_dh_pub`) via birational equivalence:
+  $$\text{Curve25519}_u = \frac{1 + \text{Ed25519}_y}{1 - \text{Ed25519}_y}$$
+
+### 1.2 Prekey Infrastructure
+To enable asynchronous messaging (when the recipient is offline), nodes publish a **Prekey Bundle** containing:
+- `IK_pub`: Identity public key.
+- `SPK_pub`: Medium-term signed prekey.
+- `SPK_sig`: Signature $\text{Ed25519Sign}(IK\_priv, SPK\_pub)$.
+- `OPK_pub_i`: A pool of one-time prekeys $i \in \{1 \dots n\}$.
+
+---
+
+## 2. Key Agreement Flow (X3DH / Noise Protocol)
+
+Initial session establishment utilizes the **Extended Triple Diffie-Hellman (X3DH)** protocol or **Noise_IK** pattern.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice as Alice (Initiator)
+    participant Bundle as Prekey Registry / Peer
+    participant Bob as Bob (Responder)
+
+    Bob->>Bundle: Publish Prekey Bundle (IK_B, SPK_B, Sig_B, OPK_B)
+    Alice->>Bundle: Fetch Bob's Prekey Bundle
+    Bundle-->>Alice: Return (IK_B, SPK_B, Sig_B, OPK_B)
+    Alice->>Alice: Verify Sig_B using IK_B
+    Alice->>Alice: Generate Ephemeral Key EK_A
+    Alice->>Alice: Compute DH1 = X25519(IK_A, SPK_B)
+    Alice->>Alice: Compute DH2 = X25519(EK_A, IK_B)
+    Alice->>Alice: Compute DH3 = X25519(EK_A, SPK_B)
+    Alice->>Alice: Compute DH4 = X25519(EK_A, OPK_B)
+    Alice->>Alice: SK = HKDF(DH1 || DH2 || DH3 || DH4)
+    Alice->>Bob: Handshake Envelope (EK_A, IK_A, OPK_B_ID, Encrypted Payload)
+    Bob->>Bob: Compute DH1..DH4 & Derive SK
+```
+
+### 2.1 Diffie-Hellman Combinations
+1. $DH_1 = \text{X25519}(IK_{A\_dh}, SPK_{B})$ *(Mutual Authentication)*
+2. $DH_2 = \text{X25519}(EK_{A}, IK_{B\_dh})$ *(Initiator Forward Secrecy)*
+3. $DH_3 = \text{X25519}(EK_{A}, SPK_{B})$ *(Responder Forward Secrecy)*
+4. $DH_4 = \text{X25519}(EK_{A}, OPK_{B})$ *(One-Time Prekey Forward Secrecy, omitted if pool exhausted)*
+
+### 2.2 Shared Key Derivation
+$$\text{SK} = \text{HKDF-Extract}(\text{Salt}=0^{32}, \text{Info}=\text{"Kamui-v2-X3DH"}, DH_1 \parallel DH_2 \parallel DH_3 \parallel DH_4)$$
+
+---
+
+## 3. Ratchet Engine (Double Ratchet System)
+
+Once session key $\text{SK}$ is established, Kamui initializes a **Double Ratchet** state machine providing **Break-in Recovery (Post-Compromise Security)** and **Forward Secrecy**.
+
+```mermaid
+graph TD
+    subgraph KDF_Root_Chain["Root KDF Chain"]
+        RK0["Root Key (RK_0)"] --> DH_Step["DH Ratchet Step"]
+        DH_Step --> RK1["Root Key (RK_1)"]
+        DH_Step --> CK_Recv["Receiving Chain Key (CK_r)"]
+    end
+
+    subgraph KDF_Symmetric_Chain["Symmetric KDF Chain"]
+        CK_Send["Sending Chain Key (CK_s)"] --> Step1["HKDF-Expand"]
+        Step1 --> CK_Send_Next["CK_s (n+1)"]
+        Step1 --> MK1["Message Key (MK_n)"]
+    end
+```
+
+### 3.1 KDF Chain Progression
+The state consists of:
+- **Root Key (`RK`)**: Updated during DH ratchet steps.
+- **Sending Chain Key (`CK_s`)**: Advanced for each sent message.
+- **Receiving Chain Key (`CK_r`)**: Advanced for each received message.
+
+#### Symmetric-Key Ratchet (Per Message):
+$$\begin{aligned}
+MK_{i} &= \text{HKDF-Expand}(CK_i, \text{"Kamui-MsgKey"}, 32) \\
+CK_{i+1} &= \text{HKDF-Expand}(CK_i, \text{"Kamui-NextChain"}, 32)
+\end{aligned}$$
+
+#### DH Ratchet Step (Per Turn Exchange):
+$$\begin{aligned}
+DH_{out} &= \text{X25519}(DH_{our\_priv}, DH_{their\_new\_pub}) \\
+(RK_{n+1}, CK_r) &= \text{HKDF-Extract-and-Expand}(RK_n, DH_{out}, \text{"Kamui-DHRatchet"})
+\end{aligned}$$
+
+### 3.2 Skipped Message Keys & Out-of-Order Delivery
+- If message sequence number $N > N_{expected}$, intermediate message keys $MK_{skipped}$ are computed and cached in a secure table.
+- **Security Constraint**: Skipped keys are bound by:
+  - Max capacity per conversation: $1000$ keys.
+  - Time-To-Live (TTL): $7$ days, after which unconsumed skipped keys are zeroized.
+
+---
+
+## 4. Encapsulated Message Envelope Architecture
+
+All transport messages over I2P SAM are wrapped in an encapsulated binary envelope to prevent payload header inspection.
+
+### 4.1 Encapsulated Wire Schema
+
+```
++-------------------+-------------------+-----------------------------------+
+| Field             | Size              | Description                       |
++-------------------+-------------------+-----------------------------------+
+| Version           | 1 byte            | Protocol Version (0x02)           |
+| Flags             | 1 byte            | Bitfield (Handshake, Ack, Prekey) |
+| Sender Fingerprint| 32 bytes          | SHA-256(IK_A_pub)                 |
+| Ephemeral DH Key  | 32 bytes          | Current Ratchet X25519 Public Key |
+| Sequence (N)      | 4 bytes (uint32)  | Counter in current chain          |
+| Prev Chain (PN)   | 4 bytes (uint32)  | Length of previous chain          |
+| IV                | 12 bytes          | GCM Nonce                         |
+| AEAD Ciphertext   | Variable          | Encrypted JSON/CBOR Payload       |
+| Auth Tag (MAC)    | 16 bytes          | AEAD Tag (AES-GCM / Poly1305)     |
++-------------------+-------------------+-----------------------------------+
+```
+
+### 4.2 Decrypted Payload JSON Schema
+
+```json
+{
+  "v": 2,
+  "msg_id": "msg_1723465190000",
+  "conv_id": "conv_c_1723465190000",
+  "timestamp": 1723465190000,
+  "content": "Encrypted text payload",
+  "attachments": [],
+  "sig": "Base64(Ed25519Sign(IK_A, SHA256(content + timestamp)))"
+}
+```
+
+---
+
+## 5. OS Boundary & Notification Metadata Leak Prevention
+
+To protect privacy against lockscreen shoulder-surfing, OS notifications, and system log inspectors:
+
+1. **Zero Plaintext Transmission**: Decrypted plaintext (`decryptedText`) MUST NOT be passed outside the application process sandbox.
+2. **Generic System Notifications**:
+   - Title: `Encrypted Message Received`
+   - Body: `New Secure Payload`
+3. **No Sender Identity Leak**: Contact names, destination hashes, and note content are strictly masked at the OS notification payload layer.
+
+---
+
+## 6. Conformance & Verification Matrix
+
+| Requirement | Implementation Component | Verification Criteria |
+| :--- | :--- | :--- |
+| **Metadata Protection** | `NotificationService` & `providers.dart` | Zero plain/sender data in `show()` |
+| **Static Code Integrity** | `flutter analyze` | `No issues found!` |
+| **Envelope Schema** | `KAMUI_PROTOCOL_SPEC.md` | Protocol specification published |

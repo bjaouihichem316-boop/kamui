@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
 
 import '../core/constants.dart';
 
@@ -32,6 +35,9 @@ class SamService {
   bool get isConnected      => _isConnected;
   bool get isSessionCreated => _isSessionCreated;
 
+  // ─── Simulated / Mock Telemetry ─────────────────────────────────────
+  /// [SIMULATED/MOCK TELEMETRY] Active tunnel counts & bandwidth metrics
+  /// (Placeholder until SAM v3.3 stats reader is attached)
   int    inboundTunnels    = 5;
   int    outboundTunnels   = 3;
   double bandwidthInKbps   = 14.2;
@@ -131,15 +137,16 @@ class SamService {
 
     if (result) {
       localDestinationKey = parseDestinationKey(reply);
-      _isSessionCreated = true;
 
-      // Fallback destination if SAM returned DESTINATION=TRANSIENT without key payload
       if (localDestinationKey == null || localDestinationKey == 'TRANSIENT') {
-        localDestinationKey = _generateFallbackDestination();
+        localDestinationKey = null;
+        _isSessionCreated = false;
+        _log('error', 'Session creation failed: SAM returned empty or transient destination key');
+      } else {
+        _isSessionCreated = true;
+        _log('success',
+            'Session "$id" active. Dest: ${_truncateDest(localDestinationKey!)}');
       }
-
-      _log('success',
-          'Session "$id" active. Dest: ${_truncateDest(localDestinationKey!)}');
     } else {
       _isSessionCreated = false;
       _log('error', 'Session creation failed (reply: ${reply ?? "timeout"})');
@@ -261,12 +268,75 @@ class SamService {
     return match?.group(1);
   }
 
-  /// Returns Base32 address formatted for the current destination key.
+  /// Decodes I2P Base64 destination string to raw bytes.
+  Uint8List? _decodeI2pBase64(String input) {
+    try {
+      String normalized = input.replaceAll('-', '+').replaceAll('~', '/');
+      while (normalized.length % 4 != 0) {
+        normalized += '=';
+      }
+      return base64Decode(normalized);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Encodes byte buffer to RFC 4648 Base32 string (lowercase, no padding).
+  String _encodeBase32(Uint8List bytes) {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+    final buffer = StringBuffer();
+    int bitBuffer = 0;
+    int bitCount = 0;
+
+    for (final b in bytes) {
+      bitBuffer = (bitBuffer << 8) | (b & 0xFF);
+      bitCount += 8;
+      while (bitCount >= 5) {
+        bitCount -= 5;
+        final index = (bitBuffer >> bitCount) & 0x1F;
+        buffer.write(alphabet[index]);
+      }
+    }
+
+    if (bitCount > 0) {
+      final index = (bitBuffer << (5 - bitCount)) & 0x1F;
+      buffer.write(alphabet[index]);
+    }
+
+    return buffer.toString();
+  }
+
+  /// Returns authentic I2P Base32 address (SHA-256 of raw Destination bytes).
   String get b32Address {
-    final key = localDestinationKey ?? 'unknown';
-    if (key.length < 32) return 'kamui-node.b32.i2p';
-    final hash = key.substring(0, 32).toLowerCase().replaceAll(RegExp(r'[^a-z2-7]'), 'x');
-    return '$hash.b32.i2p';
+    final key = localDestinationKey;
+    if (key == null || key.isEmpty) return 'kamui-node.b32.i2p';
+
+    final rawBytes = _decodeI2pBase64(key);
+    final hashBytes = rawBytes != null && rawBytes.isNotEmpty
+        ? sha256.convert(rawBytes).bytes
+        : sha256.convert(utf8.encode(key)).bytes;
+
+    final b32 = _encodeBase32(Uint8List.fromList(hashBytes));
+    return '$b32.b32.i2p';
+  }
+
+  /// Closes current SAM session and spins up a brand new SAM session for the selected persona.
+  Future<bool> switchPersonaSession(String personaId) async {
+    _log('info', 'Rotating SAM Session for Persona: "$personaId"…');
+
+    if (_isSessionCreated && sessionId != null) {
+      _write('SESSION DESTROY ID=$sessionId');
+      _isSessionCreated = false;
+      sessionId = null;
+      localDestinationKey = null;
+    }
+
+    final newSessionId = 'kamui_${personaId}_${DateTime.now().millisecondsSinceEpoch.remainder(10000)}';
+    if (_isConnected) {
+      return await createSession(newSessionId);
+    }
+    sessionId = newSessionId;
+    return true;
   }
 
   /// Disconnects and releases all resources.
@@ -389,7 +459,7 @@ class SamService {
       'isConnected':        _isConnected,
       'isSessionCreated':   _isSessionCreated,
       'sessionId':          sessionId,
-      'localDestinationKey': localDestinationKey ?? _generateFallbackDestination(),
+      'localDestinationKey': localDestinationKey,
       'inboundTunnels':     inboundTunnels,
       'outboundTunnels':    outboundTunnels,
       'bandwidthInKbps':    bandwidthInKbps,
@@ -400,9 +470,5 @@ class SamService {
   String _truncateDest(String dest) {
     if (dest.length <= 12) return dest;
     return '${dest.substring(0, 6)}…${dest.substring(dest.length - 4)}';
-  }
-
-  String _generateFallbackDestination() {
-    return 'k8x9mQ3pAzRfT7vWsL2nJhDcYbXuE5oP1gKiNqVmBw4j6F8d0eCrZlOyH3m2p8vN4X7q9w5y1z6a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r9s0t1u2v3w4x5y6z';
   }
 }

@@ -45,10 +45,10 @@ class NotificationService {
     }
   }
 
-  /// Displays a native notification for an incoming encrypted message.
+  /// Displays a native notification for an incoming encrypted message without leaking plaintext or sender metadata.
   Future<void> showMessageNotification({
-    required String senderName,
-    required String messageText,
+    String title = 'Encrypted Message Received',
+    String body  = 'New Secure Payload',
   }) async {
     if (!_isInitialized) await init();
 
@@ -76,12 +76,19 @@ class NotificationService {
     try {
       await _notificationsPlugin.show(
         DateTime.now().millisecondsSinceEpoch.remainder(100000),
-        '🔐 $senderName',
-        messageText,
+        title,
+        body,
         platformDetails,
       );
     } catch (_) {
       // Gracefully ignore notification errors
     }
+  }
+
+  /// Cancels all active and pending system notifications.
+  Future<void> cancelAllNotifications() async {
+    try {
+      await _notificationsPlugin.cancelAll();
+    } catch (_) {}
   }
 }
