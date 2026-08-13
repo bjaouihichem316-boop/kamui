@@ -6,6 +6,10 @@ import '../core/theme.dart';
 import '../services/identity_key_service.dart';
 
 /// Modal dialog displaying a Cyberpunk styled QR code for sharing I2P addresses.
+///
+/// The encoded QR payload is a v3 X3DH Handshake JSON containing the full
+/// [PreKeyBundle]: IK_ed (Ed25519), IK_dh (X25519), SPK + SPK_sig, and OPK.
+/// Scanning peers can immediately initiate an authenticated X3DH session.
 class QrShareDialog extends StatelessWidget {
   final String destinationKey;
   final String title;
@@ -13,11 +17,13 @@ class QrShareDialog extends StatelessWidget {
   const QrShareDialog({
     super.key,
     required this.destinationKey,
-    this.title = 'GARLIC DESTINATION QR',
+    this.title = 'X3DH HANDSHAKE QR',
   });
 
   @override
   Widget build(BuildContext context) {
+    // generateHandshakePayload() returns a v3 JSON payload when the service
+    // is initialized, or a v2 fallback payload otherwise.
     final qrPayload = IdentityKeyService().generateHandshakePayload(destinationKey);
 
     return AlertDialog(
@@ -70,7 +76,7 @@ class QrShareDialog extends StatelessWidget {
           ),
           const SizedBox(height: 14),
           Text(
-            'Scan to instantly pair I2P Destination Key',
+            'Scan to pair — embeds X3DH PreKey Bundle (IK · SPK · OPK)',
             style: GoogleFonts.jetBrainsMono(color: textMid, fontSize: 11),
             textAlign: TextAlign.center,
           ),

@@ -2,100 +2,362 @@ import 'dart:convert';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-/// Service for managing independent X25519 cryptographic Identity KeyPairs.
+import 'x3dh_service.dart';
+
+// ══════════════════════════════════════════════════════════════════════════════
+// IdentityKeyService
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Manages all long-term and medium-term cryptographic identity keys for a Kamui node.
+///
+/// ## Key Inventory (Kamui v3 / X3DH)
+/// | Key         | Algorithm | Purpose                        | Storage alias              |
+/// |-------------|-----------|--------------------------------|----------------------------|
+/// | IK_ed       | Ed25519   | Identity signing (SPK binding) | kamui_ik_ed25519_priv/pub  |
+/// | IK_dh       | X25519    | Identity DH (X3DH DH1/DH2)    | kamui_ik_x25519_priv/pub   |
+/// | SPK         | X25519    | Signed PreKey (DH1/DH3)        | kamui_spk_x25519_priv/pub  |
+/// | SPK_sig     | Ed25519   | Signature of SPK_pub by IK_ed  | kamui_spk_sig              |
+/// | OPK         | X25519    | One-Time PreKey (DH4, optional)| kamui_opk_x25519_priv/pub  |
 class IdentityKeyService {
   static final IdentityKeyService _instance = IdentityKeyService._internal();
   factory IdentityKeyService() => _instance;
   IdentityKeyService._internal();
 
-  static const _privKeyAlias = 'kamui_identity_x25519_priv';
-  static const _pubKeyAlias  = 'kamui_identity_x25519_pub';
+  // ─── Storage key aliases ──────────────────────────────────────────────────
+  static const _ikEdPrivAlias  = 'kamui_ik_ed25519_priv';
+  static const _ikEdPubAlias   = 'kamui_ik_ed25519_pub';
+  static const _ikDhPrivAlias  = 'kamui_ik_x25519_priv';
+  static const _ikDhPubAlias   = 'kamui_ik_x25519_pub';
+  static const _spkPrivAlias   = 'kamui_spk_x25519_priv';
+  static const _spkPubAlias    = 'kamui_spk_x25519_pub';
+  static const _spkSigAlias    = 'kamui_spk_sig';
+  static const _opkPrivAlias   = 'kamui_opk_x25519_priv';
+  static const _opkPubAlias    = 'kamui_opk_x25519_pub';
+
+  // ─── Algorithms ──────────────────────────────────────────────────────────
+  final _ed25519 = Ed25519();
+  final _x25519  = X25519();
 
   final _secureStorage = const FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
     iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
   );
 
-  final _algorithm = X25519();
-  SimpleKeyPair? _keyPair;
-  String? _publicKeyB64;
+  // ─── In-memory state ──────────────────────────────────────────────────────
+  SimpleKeyPair? _ikEdKeyPair;   // Ed25519 identity (signing)
+  SimpleKeyPair? _ikDhKeyPair;   // X25519 identity (DH)
+  SimpleKeyPair? _spkKeyPair;    // X25519 Signed PreKey
+  List<int>?    _spkSigBytes;   // Ed25519 signature over SPK_pub
+  SimpleKeyPair? _opkKeyPair;   // X25519 One-Time PreKey
+
+  String? _ikEdPubB64;
+  String? _ikDhPubB64;
+  String? _spkPubB64;
 
   bool _isInitialized = false;
   bool get isInitialized => _isInitialized;
 
-  String? get identityPublicKeyB64 => _publicKeyB64;
-  SimpleKeyPair? get keyPair => _keyPair;
+  // ─── Public accessors ─────────────────────────────────────────────────────
 
-  /// Initializes or generates the X25519 Identity KeyPair.
+  /// Ed25519 identity public key (base64) — signing surface.
+  String? get identityEdPublicKeyB64 => _ikEdPubB64;
+
+  /// X25519 identity DH public key (base64) — used in X3DH DH1/DH2.
+  String? get identityDhPublicKeyB64 => _ikDhPubB64;
+
+  /// X25519 identity DH key pair — required by [SessionManager] for X3DH.
+  SimpleKeyPair? get ikDhKeyPair => _ikDhKeyPair;
+
+  /// X25519 Signed PreKey pair — required by [SessionManager] for X3DH responder.
+  SimpleKeyPair? get spkKeyPair => _spkKeyPair;
+
+  /// X25519 One-Time PreKey pair (nullable).
+  SimpleKeyPair? get opkKeyPair => _opkKeyPair;
+
+  /// Legacy accessor — returns the X25519 DH identity keypair.
+  /// Kept for [SessionManager] v2 backward compatibility.
+  SimpleKeyPair? get keyPair => _ikDhKeyPair;
+
+  /// Legacy accessor — returns X25519 DH public key as base64.
+  String? get identityPublicKeyB64 => _ikDhPubB64;
+
+  // ─── Lifecycle ────────────────────────────────────────────────────────────
+
+  /// Loads all identity keys from secure storage, or generates a fresh keyset.
   Future<void> init() async {
     if (_isInitialized) return;
 
-    final existingPrivB64 = await _secureStorage.read(key: _privKeyAlias);
-    final existingPubB64  = await _secureStorage.read(key: _pubKeyAlias);
+    final ikEdPrivB64 = await _secureStorage.read(key: _ikEdPrivAlias);
+    final ikEdPubB64  = await _secureStorage.read(key: _ikEdPubAlias);
+    final ikDhPrivB64 = await _secureStorage.read(key: _ikDhPrivAlias);
+    final ikDhPubB64  = await _secureStorage.read(key: _ikDhPubAlias);
+    final spkPrivB64  = await _secureStorage.read(key: _spkPrivAlias);
+    final spkPubB64   = await _secureStorage.read(key: _spkPubAlias);
+    final spkSigB64   = await _secureStorage.read(key: _spkSigAlias);
+    final opkPrivB64  = await _secureStorage.read(key: _opkPrivAlias);
+    final opkPubB64   = await _secureStorage.read(key: _opkPubAlias);
 
-    if (existingPrivB64 != null && existingPubB64 != null) {
-      final privBytes = base64Decode(existingPrivB64);
-      final pubBytes  = base64Decode(existingPubB64);
+    final allPresent = ikEdPrivB64 != null && ikEdPubB64  != null &&
+                       ikDhPrivB64 != null && ikDhPubB64  != null &&
+                       spkPrivB64  != null && spkPubB64   != null &&
+                       spkSigB64   != null;
 
-      _publicKeyB64 = existingPubB64;
-      _keyPair = SimpleKeyPairData(
-        privBytes,
-        publicKey: SimplePublicKey(pubBytes, type: KeyPairType.x25519),
+    if (allPresent) {
+      // Dart promotes ikEdPrivB64 … spkSigB64 to String (non-null) here
+      // because allPresent encodes the individual != null checks.
+      _ikEdKeyPair = SimpleKeyPairData(
+        base64Decode(ikEdPrivB64),
+        publicKey: SimplePublicKey(base64Decode(ikEdPubB64), type: KeyPairType.ed25519),
+        type: KeyPairType.ed25519,
+      );
+      _ikEdPubB64 = ikEdPubB64;
+
+      _ikDhKeyPair = SimpleKeyPairData(
+        base64Decode(ikDhPrivB64),
+        publicKey: SimplePublicKey(base64Decode(ikDhPubB64), type: KeyPairType.x25519),
         type: KeyPairType.x25519,
       );
+      _ikDhPubB64 = ikDhPubB64;
+
+      _spkKeyPair = SimpleKeyPairData(
+        base64Decode(spkPrivB64),
+        publicKey: SimplePublicKey(base64Decode(spkPubB64), type: KeyPairType.x25519),
+        type: KeyPairType.x25519,
+      );
+      _spkPubB64   = spkPubB64;
+      _spkSigBytes = base64Decode(spkSigB64);
+
+      if (opkPrivB64 != null && opkPubB64 != null) {
+        _opkKeyPair = SimpleKeyPairData(
+          base64Decode(opkPrivB64),
+          publicKey: SimplePublicKey(base64Decode(opkPubB64), type: KeyPairType.x25519),
+          type: KeyPairType.x25519,
+        );
+      }
     } else {
-      await generateNewIdentityKeyPair();
+      await _generateFullKeyset();
     }
 
     _isInitialized = true;
   }
 
-  /// Generates a fresh X25519 Identity KeyPair and stores it securely.
+  /// Generates a complete fresh keyset: IK_ed, IK_dh, SPK (signed), OPK.
+  Future<void> _generateFullKeyset() async {
+    // 1. Ed25519 Identity Key (signing)
+    final ikEdKP  = await _ed25519.newKeyPair();
+    final ikEdPub = await ikEdKP.extractPublicKey();
+    final ikEdPriv = await ikEdKP.extractPrivateKeyBytes();
+
+    // 2. X25519 Identity DH Key
+    final ikDhKP  = await _x25519.newKeyPair();
+    final ikDhPub = await ikDhKP.extractPublicKey();
+    final ikDhPriv = await ikDhKP.extractPrivateKeyBytes();
+
+    // 3. X25519 Signed PreKey
+    final spkKP  = await _x25519.newKeyPair();
+    final spkPub = await spkKP.extractPublicKey();
+    final spkPriv = await spkKP.extractPrivateKeyBytes();
+
+    // 4. Sign SPK_pub with IK_ed_priv
+    final spkSig = await _ed25519.sign(spkPub.bytes, keyPair: ikEdKP);
+
+    // 5. X25519 One-Time PreKey
+    final opkKP  = await _x25519.newKeyPair();
+    final opkPub = await opkKP.extractPublicKey();
+    final opkPriv = await opkKP.extractPrivateKeyBytes();
+
+    // Persist to secure storage
+    await _secureStorage.write(key: _ikEdPrivAlias, value: base64Encode(ikEdPriv));
+    await _secureStorage.write(key: _ikEdPubAlias,  value: base64Encode(ikEdPub.bytes));
+    await _secureStorage.write(key: _ikDhPrivAlias, value: base64Encode(ikDhPriv));
+    await _secureStorage.write(key: _ikDhPubAlias,  value: base64Encode(ikDhPub.bytes));
+    await _secureStorage.write(key: _spkPrivAlias,  value: base64Encode(spkPriv));
+    await _secureStorage.write(key: _spkPubAlias,   value: base64Encode(spkPub.bytes));
+    await _secureStorage.write(key: _spkSigAlias,   value: base64Encode(spkSig.bytes));
+    await _secureStorage.write(key: _opkPrivAlias,  value: base64Encode(opkPriv));
+    await _secureStorage.write(key: _opkPubAlias,   value: base64Encode(opkPub.bytes));
+
+    // Update in-memory state
+    _ikEdKeyPair  = ikEdKP;
+    _ikEdPubB64   = base64Encode(ikEdPub.bytes);
+    _ikDhKeyPair  = ikDhKP;
+    _ikDhPubB64   = base64Encode(ikDhPub.bytes);
+    _spkKeyPair   = spkKP;
+    _spkPubB64    = base64Encode(spkPub.bytes);
+    _spkSigBytes  = spkSig.bytes;
+    _opkKeyPair   = opkKP;
+  }
+
+  /// Force-generates a new complete keyset (e.g. duress wipe, key rotation).
   Future<void> generateNewIdentityKeyPair() async {
-    final keyPair = await _algorithm.newKeyPair();
-    final pubKey = await keyPair.extractPublicKey();
-    final privBytes = await keyPair.extractPrivateKeyBytes();
-
-    _keyPair = keyPair;
-    _publicKeyB64 = base64Encode(pubKey.bytes);
-
-    await _secureStorage.write(key: _privKeyAlias, value: base64Encode(privBytes));
-    await _secureStorage.write(key: _pubKeyAlias,  value: _publicKeyB64!);
+    await _generateFullKeyset();
+    _isInitialized = true;
   }
 
-  /// Clears stored identity keys from secure storage.
-  Future<void> clearKeys() async {
-    await _secureStorage.delete(key: _privKeyAlias);
-    await _secureStorage.delete(key: _pubKeyAlias);
-    _keyPair = null;
-    _publicKeyB64 = null;
-    _isInitialized = false;
+  /// Builds the local [PreKeyBundle] for sharing with peers (synchronous, no OPK).
+  /// For the full bundle including OPK, call [generatePreKeyBundleAsync] instead.
+  PreKeyBundle? generatePreKeyBundle() {
+    final edPubB64 = _ikEdPubB64;
+    final dhPubB64 = _ikDhPubB64;
+    final spPubB64 = _spkPubB64;
+    final spkSig   = _spkSigBytes;
+
+    if (edPubB64 == null || dhPubB64 == null || spPubB64 == null || spkSig == null) {
+      return null;
+    }
+
+    return PreKeyBundle(
+      ikPubEd: base64Decode(edPubB64),
+      ikPubDh: base64Decode(dhPubB64),
+      spkPub:  base64Decode(spPubB64),
+      spkSig:  spkSig,
+      opkPub:  null, // OPK resolved asynchronously — see generatePreKeyBundleAsync()
+    );
   }
 
-  /// Encodes a JSON Handshake Payload combining Destination Key and X25519 Identity Public Key.
-  String generateHandshakePayload(String destinationKey) {
-    final payloadMap = {
-      'v': 2,
+  /// Async version that correctly extracts the OPK public key.
+  Future<PreKeyBundle?> generatePreKeyBundleAsync() async {
+    if (_ikEdKeyPair == null || _ikDhKeyPair == null ||
+        _spkKeyPair  == null || _spkSigBytes == null) {
+      return null;
+    }
+
+    final ikEdPub = await _ikEdKeyPair!.extractPublicKey();
+    final ikDhPub = await _ikDhKeyPair!.extractPublicKey();
+    final spkPub  = await _spkKeyPair!.extractPublicKey();
+
+    List<int>? opkPubBytes;
+    if (_opkKeyPair != null) {
+      final opkPub = await _opkKeyPair!.extractPublicKey();
+      opkPubBytes  = opkPub.bytes;
+    }
+
+    return PreKeyBundle(
+      ikPubEd: ikEdPub.bytes,
+      ikPubDh: ikDhPub.bytes,
+      spkPub:  spkPub.bytes,
+      spkSig:  _spkSigBytes!,
+      opkPub:  opkPubBytes,
+    );
+  }
+
+  // ─── Handshake Payload (QR exchange) ─────────────────────────────────────
+
+  /// Generates a v3 JSON Handshake Payload embedding the full PreKeyBundle.
+  ///
+  /// Wire format:
+  /// ```json
+  /// {
+  ///   "v": 3,
+  ///   "dest": "<I2P destination key>",
+  ///   "ik_ed":   "<base64 Ed25519 pub>",
+  ///   "ik_dh":   "<base64 X25519 DH pub>",
+  ///   "spk":     "<base64 X25519 SPK pub>",
+  ///   "spk_sig": "<base64 Ed25519 sig of SPK pub>",
+  ///   "opk":     "<base64 X25519 OPK pub>"   // optional
+  /// }
+  /// ```
+  Future<String> generateHandshakePayloadAsync(String destinationKey) async {
+    final bundle = await generatePreKeyBundleAsync();
+    if (bundle == null) {
+      // Fallback: v2-compatible payload if keys not initialized
+      return jsonEncode({'v': 2, 'dest': destinationKey, 'id_pub': _ikDhPubB64 ?? ''});
+    }
+    return jsonEncode({
+      'v':    3,
       'dest': destinationKey,
-      'id_pub': _publicKeyB64 ?? '',
-    };
-    return jsonEncode(payloadMap);
+      ...bundle.toJson(),
+    });
   }
 
-  /// Parses a Handshake Payload or QR data string.
+  /// Synchronous wrapper — returns v3 payload when keys are loaded, v2 otherwise.
+  /// Used by [QrShareDialog] which calls this from a synchronous build context.
+  String generateHandshakePayload(String destinationKey) {
+    if (_ikEdPubB64 == null || _ikDhPubB64 == null ||
+        _spkPubB64  == null || _spkSigBytes == null) {
+      // Fallback to v2 if not yet initialized
+      return jsonEncode({'v': 2, 'dest': destinationKey, 'id_pub': _ikDhPubB64 ?? ''});
+    }
+    return jsonEncode({
+      'v':       3,
+      'dest':    destinationKey,
+      'ik_ed':   _ikEdPubB64,
+      'ik_dh':   _ikDhPubB64,
+      'spk':     _spkPubB64,
+      'spk_sig': base64Encode(_spkSigBytes!),
+    });
+  }
+
+  /// Parses a Handshake Payload (v2 or v3) or a raw I2P destination string.
+  ///
+  /// Returns a map with keys:
+  /// - `destination`      — I2P destination key
+  /// - `identityPublicKey`— X25519 DH public key (base64), empty if absent
+  /// - `preKeyBundle`     — JSON-encoded [PreKeyBundle] if v3, empty if absent
   Map<String, String> parseHandshakePayload(String rawPayload) {
     try {
       final decoded = jsonDecode(rawPayload) as Map<String, dynamic>;
+      final dest    = (decoded['dest'] as String? ?? rawPayload).trim();
+      final version = decoded['v'] as int? ?? 2;
+
+      if (version >= 3 &&
+          decoded.containsKey('ik_ed')   &&
+          decoded.containsKey('ik_dh')   &&
+          decoded.containsKey('spk')     &&
+          decoded.containsKey('spk_sig')) {
+        // v3 — full PreKeyBundle embedded
+        final bundle = PreKeyBundle(
+          ikPubEd: base64Decode(decoded['ik_ed']   as String),
+          ikPubDh: base64Decode(decoded['ik_dh']   as String),
+          spkPub:  base64Decode(decoded['spk']     as String),
+          spkSig:  base64Decode(decoded['spk_sig'] as String),
+          opkPub:  decoded['opk'] != null
+                   ? base64Decode(decoded['opk'] as String)
+                   : null,
+        );
+        return {
+          'destination':       dest,
+          'identityPublicKey': decoded['ik_dh'] as String? ?? '',
+          'preKeyBundle':      jsonEncode(bundle.toJson()),
+        };
+      }
+
+      // v2 — single X25519 DH key
       return {
-        'destination': (decoded['dest'] as String? ?? rawPayload).trim(),
+        'destination':       dest,
         'identityPublicKey': (decoded['id_pub'] as String? ?? '').trim(),
+        'preKeyBundle':      '',
       };
     } catch (_) {
-      // Fallback if plain destination string was scanned
+      // Plain I2P destination string (legacy QR)
       return {
-        'destination': rawPayload.trim(),
+        'destination':       rawPayload.trim(),
         'identityPublicKey': '',
+        'preKeyBundle':      '',
       };
     }
+  }
+
+  // ─── Lifecycle: Wipe ─────────────────────────────────────────────────────
+
+  /// Erases all identity keys from secure storage (duress wipe).
+  Future<void> clearKeys() async {
+    for (final alias in [
+      _ikEdPrivAlias, _ikEdPubAlias,
+      _ikDhPrivAlias, _ikDhPubAlias,
+      _spkPrivAlias,  _spkPubAlias,  _spkSigAlias,
+      _opkPrivAlias,  _opkPubAlias,
+    ]) {
+      await _secureStorage.delete(key: alias);
+    }
+    _ikEdKeyPair  = null;
+    _ikDhKeyPair  = null;
+    _spkKeyPair   = null;
+    _opkKeyPair   = null;
+    _spkSigBytes  = null;
+    _ikEdPubB64   = null;
+    _ikDhPubB64   = null;
+    _spkPubB64    = null;
+    _isInitialized = false;
   }
 }

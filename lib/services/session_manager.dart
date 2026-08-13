@@ -2,10 +2,31 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:cryptography/cryptography.dart';
-import 'crypto_service.dart';
+import 'double_ratchet.dart';
 import 'identity_key_service.dart';
+import 'x3dh_service.dart';
 
-/// State of an active E2EE ratcheted session between local identity and peer identity.
+// ══════════════════════════════════════════════════════════════════════════════
+// Exceptions
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Thrown when a secure v2/v3/v4 session cannot be established or encryption
+/// fails. Callers MUST surface this error and abort the send — no silent
+/// downgrade to weaker encryption is permitted.
+class SessionUnavailableException implements Exception {
+  final String reason;
+  const SessionUnavailableException(this.reason);
+
+  @override
+  String toString() => 'SessionUnavailableException: $reason';
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Legacy v2 Session State (backward compatibility only)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Symmetric-only session state for Kamui v2 peers (no DH ratchet).
+/// Retained for backward compatibility with peers that have not upgraded to v4.
 class SessionState {
   final String conversationId;
   final String peerIdentityPublicKeyB64;
@@ -17,14 +38,13 @@ class SessionState {
     required this.conversationId,
     required this.peerIdentityPublicKeyB64,
     required this.sessionKey,
-    this.sendCounter = 0,
+    this.sendCounter    = 0,
     this.receiveCounter = 0,
   });
 
-  /// Computes symmetric message key for send ratchet step.
-  /// Counter is encoded as 4-byte little-endian to prevent overflow after 255 messages.
+  /// Symmetric send ratchet step — derives message key from (sessionKey ‖ counter).
   Uint8List getNextSendKey() {
-    final c = sendCounter;
+    final c     = sendCounter;
     final input = Uint8List.fromList([
       ...sessionKey,
       c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, (c >> 24) & 0xFF,
@@ -33,10 +53,9 @@ class SessionState {
     return Uint8List.fromList(sha256.convert(input).bytes);
   }
 
-  /// Computes symmetric message key for receive ratchet step.
-  /// Returns the key WITHOUT advancing the counter — caller must call commitReceive() on success.
+  /// Peeks the receive key WITHOUT advancing the counter.
   Uint8List peekReceiveKey() {
-    final c = receiveCounter;
+    final c     = receiveCounter;
     final input = Uint8List.fromList([
       ...sessionKey,
       c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, (c >> 24) & 0xFF,
@@ -48,23 +67,67 @@ class SessionState {
   void commitReceive() => receiveCounter++;
 }
 
-/// End-to-End Encryption Session Manager for Kamui v2.
+// ══════════════════════════════════════════════════════════════════════════════
+// Session Manager
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// End-to-End Encryption Session Manager for Kamui v2 / v4.
+///
+/// ## Protocol routing
+///
+/// | Version | Trigger                       | Encryption                        |
+/// |---------|-------------------------------|-----------------------------------|
+/// | **v4**  | `peerPreKeyBundleJson` present| X3DH → Double Ratchet (AES-GCM)   |
+/// | **v2**  | Only `peerIdentityPublicKeyB64`| Single X25519 DH → Symmetric KDF  |
+///
+/// ## Fail-Closed guarantee
+/// [encryptMessage] ALWAYS throws [SessionUnavailableException] on any error.
+/// There is NO silent fallback to plaintext or weaker encryption.
 class SessionManager {
   static final SessionManager _instance = SessionManager._internal();
   factory SessionManager() => _instance;
   SessionManager._internal();
 
-  final Map<String, SessionState> _sessions = {};
+  // Active v4 Double Ratchet sessions
+  final Map<String, DoubleRatchetSession> _v4Sessions = {};
+
+  // Active v2 legacy sessions (backward compat only)
+  final Map<String, SessionState> _v2Sessions = {};
+
   final _x25519 = X25519();
   final _aesGcm = AesGcm.with256bits();
 
-  /// Retrieves or computes an active E2EE session for a conversation thread.
+  // ── Session establishment ─────────────────────────────────────────────────
+
+  /// Retrieves or establishes a **v4 Double Ratchet** session for [conversationId].
+  ///
+  /// Requires [peerPreKeyBundleJson] (v3 JSON from [IdentityKeyService.parseHandshakePayload]).
+  /// Returns the [DoubleRatchetSession], or `null` if keys are unavailable.
+  Future<DoubleRatchetSession?> getOrCreateV4Session(
+    String conversationId, {
+    required String peerPreKeyBundleJson,
+  }) async {
+    if (_v4Sessions.containsKey(conversationId)) {
+      return _v4Sessions[conversationId];
+    }
+
+    final identityService = IdentityKeyService();
+    if (!identityService.isInitialized) {
+      await identityService.init();
+    }
+
+    return _establishV4Session(conversationId, peerPreKeyBundleJson, identityService);
+  }
+
+  /// Retrieves or establishes a **v2 legacy** session for [conversationId].
   Future<SessionState?> getOrCreateSession(
     String conversationId, {
     String? peerIdentityPublicKeyB64,
+    String? peerPreKeyBundleJson,
   }) async {
-    if (_sessions.containsKey(conversationId)) {
-      return _sessions[conversationId];
+    // Prefer v2 legacy path when no bundle provided
+    if (_v2Sessions.containsKey(conversationId)) {
+      return _v2Sessions[conversationId];
     }
 
     if (peerIdentityPublicKeyB64 == null || peerIdentityPublicKeyB64.isEmpty) {
@@ -76,125 +139,249 @@ class SessionManager {
       await identityService.init();
     }
 
-    final localKeyPair = identityService.keyPair;
-    if (localKeyPair == null) return null;
+    return _establishV2Session(conversationId, peerIdentityPublicKeyB64, identityService);
+  }
+
+  // ── Encryption ────────────────────────────────────────────────────────────
+
+  /// Encrypts [plaintext] using the **v4 Double Ratchet**.
+  ///
+  /// Wire format: `"kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>"`
+  ///
+  /// **Fail-Closed**: throws [SessionUnavailableException] on any failure.
+  Future<String> encryptV4(
+    String conversationId,
+    String plaintext, {
+    required String peerPreKeyBundleJson,
+  }) async {
+    final session = await getOrCreateV4Session(
+      conversationId,
+      peerPreKeyBundleJson: peerPreKeyBundleJson,
+    );
+
+    if (session == null) {
+      throw const SessionUnavailableException(
+        'No v4 Double Ratchet session — peer PreKeyBundle required.',
+      );
+    }
 
     try {
-      final remotePubBytes = base64Decode(peerIdentityPublicKeyB64);
-      final remotePubKey = SimplePublicKey(remotePubBytes, type: KeyPairType.x25519);
-
-      final sharedSecret = await _x25519.sharedSecretKey(
-        keyPair: localKeyPair,
-        remotePublicKey: remotePubKey,
-      );
-
-      final sharedBytes = await sharedSecret.extractBytes();
-      final derivedSessionKey = Uint8List.fromList(
-        sha256.convert(Uint8List.fromList([...sharedBytes, ...utf8.encode('Kamui-Session-v2')])).bytes,
-      );
-
-      final newState = SessionState(
-        conversationId: conversationId,
-        peerIdentityPublicKeyB64: peerIdentityPublicKeyB64,
-        sessionKey: derivedSessionKey,
-      );
-
-      _sessions[conversationId] = newState;
-      return newState;
-    } catch (_) {
-      return null;
+      return await session.encrypt(plaintext);
+    } on RatchetException catch (e) {
+      throw SessionUnavailableException('v4 encryption failed: ${e.reason}');
     }
   }
 
-  /// Encrypts plaintext message using the ratcheted conversation session key.
+  /// Decrypts a `"kamui_v4:..."` payload using the **v4 Double Ratchet**.
+  ///
+  /// Handles:
+  /// - Normal in-order messages (symmetric ratchet advance)
+  /// - Out-of-order messages (skipped key store lookup)
+  /// - New DH epoch messages (full DH ratchet step)
+  ///
+  /// Returns the plaintext or throws [SessionUnavailableException].
+  Future<String> decryptV4(
+    String conversationId,
+    String wirePayload, {
+    required String peerPreKeyBundleJson,
+  }) async {
+    final session = await getOrCreateV4Session(
+      conversationId,
+      peerPreKeyBundleJson: peerPreKeyBundleJson,
+    );
+
+    if (session == null) {
+      throw const SessionUnavailableException(
+        'No v4 Double Ratchet session available for decryption.',
+      );
+    }
+
+    try {
+      return await session.decrypt(wirePayload);
+    } on RatchetException catch (e) {
+      throw SessionUnavailableException('v4 decryption failed: ${e.reason}');
+    }
+  }
+
+  /// Encrypts [plaintext] using the legacy **v2 symmetric** session.
+  ///
+  /// Wire format: `"kamui_v2:<nonceB64>:<ciphertextB64>"`
+  ///
+  /// **Fail-Closed**: throws [SessionUnavailableException] on any failure.
   Future<String> encryptMessage(
     String conversationId,
     String plaintext, {
     String? peerIdentityPublicKeyB64,
+    String? peerPreKeyBundleJson,
   }) async {
     final session = await getOrCreateSession(
       conversationId,
       peerIdentityPublicKeyB64: peerIdentityPublicKeyB64,
+      peerPreKeyBundleJson:     peerPreKeyBundleJson,
     );
 
-    if (session != null) {
-      try {
-        final messageKey = session.getNextSendKey();
-        final secretKey = SecretKey(messageKey);
-        final nonce = _aesGcm.newNonce();
-        final secretBox = await _aesGcm.encrypt(
-          utf8.encode(plaintext),
-          secretKey: secretKey,
-          nonce: nonce,
-        );
-
-        final nonceB64 = base64Encode(secretBox.nonce);
-        final concatenated = Uint8List.fromList([...secretBox.cipherText, ...secretBox.mac.bytes]);
-        final ciphertextB64 = base64Encode(concatenated);
-        return 'kamui_v2:$nonceB64:$ciphertextB64';
-      } catch (_) {
-        // Fallback to CryptoService if session encryption fails
-      }
+    if (session == null) {
+      throw const SessionUnavailableException(
+        'No active v2 session — peer identity key required to establish E2EE.',
+      );
     }
 
-    return CryptoService().encrypt(plaintext);
+    try {
+      final messageKey = session.getNextSendKey();
+      final secretKey  = SecretKey(messageKey);
+      final nonce      = _aesGcm.newNonce();
+      final secretBox  = await _aesGcm.encrypt(
+        utf8.encode(plaintext),
+        secretKey: secretKey,
+        nonce:     nonce,
+      );
+
+      final nonceB64      = base64Encode(secretBox.nonce);
+      final concatenated  = Uint8List.fromList([...secretBox.cipherText, ...secretBox.mac.bytes]);
+      final ciphertextB64 = base64Encode(concatenated);
+      return 'kamui_v2:$nonceB64:$ciphertextB64';
+    } catch (e) {
+      throw SessionUnavailableException(
+        'AES-GCM encryption failed for conversation $conversationId: $e',
+      );
+    }
   }
 
-  /// Decrypts encrypted wire payload using session ratchet key or fallback.
+  /// Decrypts a `"kamui_v2:..."` payload using the legacy **v2 symmetric** session.
   Future<String?> decryptMessage(
     String conversationId,
     String wirePayload, {
     String? peerIdentityPublicKeyB64,
+    String? peerPreKeyBundleJson,
   }) async {
     if (wirePayload.startsWith('kamui_v2:')) {
-      // Safe split: prefix is exactly 'kamui_v2:', nonce is next segment,
-      // everything after the second ':' is the ciphertext (may contain '=' padding).
-      final firstColon  = wirePayload.indexOf(':');          // after 'kamui_v2'
+      final firstColon  = wirePayload.indexOf(':');
       final secondColon = wirePayload.indexOf(':', firstColon + 1);
-      if (firstColon != -1 && secondColon != -1 && secondColon < wirePayload.length - 1) {
+      if (firstColon  != -1 &&
+          secondColon != -1 &&
+          secondColon < wirePayload.length - 1) {
         final nonceB64      = wirePayload.substring(firstColon + 1, secondColon);
         final ciphertextB64 = wirePayload.substring(secondColon + 1);
 
         final session = await getOrCreateSession(
           conversationId,
           peerIdentityPublicKeyB64: peerIdentityPublicKeyB64,
+          peerPreKeyBundleJson:     peerPreKeyBundleJson,
         );
 
         if (session != null) {
-          // Peek the key without advancing counter — only commit on success
           final messageKey = session.peekReceiveKey();
           try {
             final secretKey       = SecretKey(messageKey);
             final nonce           = base64Decode(nonceB64);
             final concatenated    = base64Decode(ciphertextB64);
-
             const macLength       = 16;
             final cipherTextBytes = concatenated.sublist(0, concatenated.length - macLength);
             final macBytes        = concatenated.sublist(concatenated.length - macLength);
-
-            final secretBox = SecretBox(
+            final secretBox       = SecretBox(
               cipherTextBytes,
               nonce: nonce,
-              mac: Mac(macBytes),
+              mac:   Mac(macBytes),
             );
-
             final clearBytes = await _aesGcm.decrypt(secretBox, secretKey: secretKey);
-            // Decryption succeeded — advance the receive counter
             session.commitReceive();
             return utf8.decode(clearBytes);
           } catch (_) {
-            // Counter NOT advanced — no ratchet desync on MAC failure
+            // MAC failure — counter NOT advanced, no ratchet desync
           }
         }
       }
     }
-
-    // Fallback for legacy payloads
-    return CryptoService().decrypt(wirePayload) ?? wirePayload;
+    // Legacy / unknown payload — callers display "message encrypted with older protocol"
+    return null;
   }
 
-  /// Resets all active sessions from memory.
+  /// Resets all active sessions (use during duress wipe / key rotation).
   void reset() {
-    _sessions.clear();
+    _v4Sessions.clear();
+    _v2Sessions.clear();
+  }
+
+  // ── Private helpers ───────────────────────────────────────────────────────
+
+  /// Establishes a v4 Double Ratchet session via X3DH → DoubleRatchetSession.initAlice.
+  Future<DoubleRatchetSession?> _establishV4Session(
+    String             conversationId,
+    String             peerPreKeyBundleJson,
+    IdentityKeyService identityService,
+  ) async {
+    final ikADh = identityService.ikDhKeyPair;
+    if (ikADh == null) {
+      throw const SessionUnavailableException(
+        'Local X25519 DH identity key not initialized — cannot perform X3DH.',
+      );
+    }
+
+    try {
+      final bundleMap = jsonDecode(peerPreKeyBundleJson) as Map<String, dynamic>;
+      final bundle    = PreKeyBundle.fromJson(bundleMap);
+
+      // X3DH handshake — SPK signature verified internally; throws on failure
+      final x3dhResult = await X3dhService.initiatorHandshake(
+        ikADh:   ikADh,
+        bundleB: bundle,
+      );
+
+      // Initialise Double Ratchet as Alice (initiator)
+      final session = await DoubleRatchetSession.initAlice(
+        conversationId:           conversationId,
+        peerIdentityPublicKeyB64: base64Encode(bundle.ikPubDh),
+        sk:         x3dhResult.sharedSecret,
+        bobSpkPub:  bundle.spkPub,
+      );
+
+      _v4Sessions[conversationId] = session;
+      return session;
+    } on X3dhException catch (e) {
+      throw SessionUnavailableException('X3DH handshake failed: ${e.reason}');
+    } on RatchetException catch (e) {
+      throw SessionUnavailableException('Double Ratchet init failed: ${e.reason}');
+    } catch (e) {
+      throw SessionUnavailableException(
+        'v4 session setup failed for $conversationId: $e',
+      );
+    }
+  }
+
+  /// Establishes a v2 legacy session (single X25519 DH + SHA-256 KDF).
+  Future<SessionState?> _establishV2Session(
+    String             conversationId,
+    String             peerIdentityPublicKeyB64,
+    IdentityKeyService identityService,
+  ) async {
+    final localKeyPair = identityService.keyPair;
+    if (localKeyPair == null) return null;
+
+    try {
+      final remotePubBytes = base64Decode(peerIdentityPublicKeyB64);
+      final remotePubKey   = SimplePublicKey(remotePubBytes, type: KeyPairType.x25519);
+      final sharedSecret   = await _x25519.sharedSecretKey(
+        keyPair:         localKeyPair,
+        remotePublicKey: remotePubKey,
+      );
+      final sharedBytes    = await sharedSecret.extractBytes();
+      final derivedKey     = Uint8List.fromList(
+        sha256.convert(Uint8List.fromList(
+          [...sharedBytes, ...utf8.encode('Kamui-Session-v2')],
+        )).bytes,
+      );
+
+      final newState = SessionState(
+        conversationId:           conversationId,
+        peerIdentityPublicKeyB64: peerIdentityPublicKeyB64,
+        sessionKey:               derivedKey,
+      );
+      _v2Sessions[conversationId] = newState;
+      return newState;
+    } catch (e) {
+      throw SessionUnavailableException(
+        'Key agreement failed for conversation $conversationId: $e',
+      );
+    }
   }
 }

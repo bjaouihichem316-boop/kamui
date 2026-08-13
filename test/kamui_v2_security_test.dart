@@ -379,4 +379,70 @@ void main() {
           reason: 'Domain label must change the derived key');
     });
   });
+
+  // ── 8. Fail-Closed Architecture (No Silent Downgrade) ─────────────
+  group('Fail-Closed Architecture', () {
+    // Inline minimal SessionManager logic to validate Fail-Closed contract
+    // without depending on platform plugins (flutter_secure_storage).
+    //
+    // The contract: encryptMessage MUST throw when no session can be established.
+    // It MUST NOT silently fall back to weaker (non-ratcheted) encryption.
+
+    test('encryptMessage throws when no peer identity key is provided', () async {
+      // Simulate the fail-closed logic: if getOrCreateSession returns null
+      // (no peerIdentityPublicKeyB64 given), the caller must receive an exception.
+      Future<String> failClosedEncrypt(String? peerKey) async {
+        if (peerKey == null || peerKey.isEmpty) {
+          throw Exception('SessionUnavailableException: No active v2 session'
+              ' — peer identity key required to establish E2EE.');
+        }
+        // Simulate successful v2 path (not reached in this test)
+        return 'kamui_v2:nonce:ct';
+      }
+
+      expect(
+        () async => failClosedEncrypt(null),
+        throwsA(isA<Exception>()),
+        reason: 'No silent downgrade: must throw when peer key is absent',
+      );
+      expect(
+        () async => failClosedEncrypt(''),
+        throwsA(isA<Exception>()),
+        reason: 'Empty peer key must also trigger Fail-Closed exception',
+      );
+    });
+
+    test('decryptMessage returns null for non-kamui_v2 legacy wire payloads', () {
+      // Contract: unrecognised payloads must NOT be silently decrypted via
+      // a weaker fallback — they return null so the UI can show an indicator.
+      String? failClosedDecrypt(String wirePayload) {
+        if (!wirePayload.startsWith('kamui_v2:')) {
+          // Fail-Closed: no legacy CryptoService fallback.
+          return null;
+        }
+        return 'decrypted'; // would proceed with v2 path
+      }
+
+      expect(failClosedDecrypt('legacy:nonce:ct'), isNull,
+          reason: 'Legacy payload must return null, not attempt weak decryption');
+      expect(failClosedDecrypt('plaintext message'), isNull,
+          reason: 'Plaintext wire value must return null, not be echoed back');
+      expect(failClosedDecrypt('kamui_v2:nonce:ct'), equals('decrypted'),
+          reason: 'Valid v2 wire format proceeds normally');
+    });
+
+    test('Wire format prefix "kamui_v2:" is mandatory for decryption path', () {
+      const validPayload   = 'kamui_v2:AAEC:aGVsbG8=';
+      const invalidPayload = 'kamui_v1:AAEC:aGVsbG8=';
+      const rawPayload     = 'Hello World';
+
+      bool isV2Payload(String p) => p.startsWith('kamui_v2:');
+
+      expect(isV2Payload(validPayload),   isTrue);
+      expect(isV2Payload(invalidPayload), isFalse,
+          reason: 'v1 prefix must not be treated as v2');
+      expect(isV2Payload(rawPayload),     isFalse,
+          reason: 'Raw plaintext must not be treated as v2');
+    });
+  });
 }

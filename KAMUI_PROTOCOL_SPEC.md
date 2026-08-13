@@ -165,12 +165,26 @@ To protect privacy against lockscreen shoulder-surfing, OS notifications, and sy
    - Body: `New Secure Payload`
 3. **No Sender Identity Leak**: Contact names, destination hashes, and note content are strictly masked at the OS notification payload layer.
 
+### 5.1 Duress Panic Mode (Defense-in-Depth)
+
+When a **Duress PIN** is entered, Kamui performs a **defense-in-depth local storage & key wipe**:
+- All SQLite message and contact databases are deleted from disk.
+- All keys in `flutter_secure_storage` (platform Keychain/Keystore) are erased.
+- The UI transitions to a disguised decoy feed with no trace of the Kamui session.
+
+> **Accuracy Note**: The Duress mechanism is a **defense-in-depth local wipe** — it does not guarantee forensic-unrecoverability at the hardware or OS level (e.g., against NAND flash wear-leveling or advanced chip-off forensics). Claims of "forensic-proof destruction" are not made. The wipe is meaningful protection against casual device access, law-enforcement logical extractions, and opportunistic adversaries.
+
 ---
 
 ## 6. Conformance & Verification Matrix
 
-| Requirement | Implementation Component | Verification Criteria |
-| :--- | :--- | :--- |
-| **Metadata Protection** | `NotificationService` & `providers.dart` | Zero plain/sender data in `show()` |
-| **Static Code Integrity** | `flutter analyze` | `No issues found!` |
-| **Envelope Schema** | `KAMUI_PROTOCOL_SPEC.md` | Protocol specification published |
+| Requirement | Implementation Component | Status | Verification Criteria |
+| :--- | :--- | :---: | :--- |
+| **Metadata Protection** | `NotificationService` & `providers.dart` | ✅ Implemented | Zero plain/sender data in `show()` |
+| **Static Code Integrity** | `flutter analyze` | ✅ Implemented | `No issues found!` |
+| **Envelope Schema** | `KAMUI_PROTOCOL_SPEC.md` | ✅ Implemented | Protocol specification published |
+| **Fail-Closed Encryption** | `SessionManager.encryptMessage()` | ✅ Implemented | Throws `SessionUnavailableException`; no silent downgrade |
+| **Duress Wipe (Defense-in-Depth)** | DB + `flutter_secure_storage` erase | ✅ Implemented | Local storage & key wipe on duress PIN |
+| **Full X3DH Key Agreement** | `SessionManager` | 🗺️ Planned | Roadmap v3 — single X25519 DH in current impl |
+| **Double Ratchet (Signal-spec)** | `SessionState` | 🗺️ Planned | Roadmap v3 — symmetric-only ratchet currently |
+| **Binary Wire Envelope** | `SAMService` transport layer | 🗺️ Planned | Roadmap v3 — text prefix format currently |
