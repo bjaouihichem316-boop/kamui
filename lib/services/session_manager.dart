@@ -86,7 +86,18 @@ class SessionState {
 class SessionManager {
   static final SessionManager _instance = SessionManager._internal();
   factory SessionManager() => _instance;
-  SessionManager._internal();
+
+  final IdentityKeyService Function() _getIdentityService;
+
+  SessionManager._internal({IdentityKeyService? identityService})
+      : _getIdentityService = identityService != null
+            ? (() => identityService)
+            : (() => IdentityKeyService());
+
+  /// Factory for isolated instances in tests or multi-identity scenarios.
+  factory SessionManager.isolated({IdentityKeyService? identityService}) {
+    return SessionManager._internal(identityService: identityService);
+  }
 
   // Active v4 Double Ratchet sessions
   final Map<String, DoubleRatchetSession> _v4Sessions = {};
@@ -126,7 +137,7 @@ class SessionManager {
       return _v4Sessions[conversationId]!;
     }
 
-    final identityService = IdentityKeyService();
+    final identityService = _getIdentityService();
     if (!identityService.isInitialized) {
       await identityService.init();
     }
@@ -161,7 +172,7 @@ class SessionManager {
       return _v4Sessions[conversationId];
     }
 
-    final identityService = IdentityKeyService();
+    final identityService = _getIdentityService();
     if (!identityService.isInitialized) {
       await identityService.init();
     }
@@ -184,7 +195,7 @@ class SessionManager {
       return null;
     }
 
-    final identityService = IdentityKeyService();
+    final identityService = _getIdentityService();
     if (!identityService.isInitialized) {
       await identityService.init();
     }
@@ -196,7 +207,11 @@ class SessionManager {
 
   /// Encrypts [plaintext] using the **v4 Double Ratchet**.
   ///
-  /// Wire format: `"kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>"`
+  /// If no session exists for [conversationId], performs X3DH handshake as Alice,
+  /// initializes the ratchet session, encrypts the first message, and wraps
+  /// the result in a [HandshakeInitEnvelope] JSON string.
+  ///
+  /// If a session is already active, returns `"kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>"`.
   ///
   /// **Fail-Closed**: throws [SessionUnavailableException] on any failure.
   Future<String> encryptV4(
@@ -204,33 +219,80 @@ class SessionManager {
     String plaintext, {
     String? peerPreKeyBundleJson,
   }) async {
-    DoubleRatchetSession? session = _v4Sessions[conversationId];
-    if (session == null && peerPreKeyBundleJson != null && peerPreKeyBundleJson.isNotEmpty) {
-      session = await getOrCreateV4Session(
-        conversationId,
-        peerPreKeyBundleJson: peerPreKeyBundleJson,
+    final identityService = _getIdentityService();
+    if (!identityService.isInitialized) {
+      await identityService.init();
+    }
+
+    // 1. If session already exists, encrypt normally
+    if (_v4Sessions.containsKey(conversationId)) {
+      final session = _v4Sessions[conversationId]!;
+      try {
+        return await session.encrypt(plaintext);
+      } on RatchetException catch (e) {
+        throw SessionUnavailableException('v4 encryption failed: ${e.reason}');
+      }
+    }
+
+    // 2. First message of conversation — build HandshakeInitEnvelope
+    if (peerPreKeyBundleJson == null || peerPreKeyBundleJson.isEmpty) {
+      throw const SessionUnavailableException(
+        'No v4 Double Ratchet session — peer PreKeyBundle required to establish session.',
       );
     }
 
-    if (session == null) {
+    final ikADh = identityService.ikDhKeyPair;
+    if (ikADh == null ||
+        identityService.identityEdPublicKeyB64 == null ||
+        identityService.identityDhPublicKeyB64 == null) {
       throw const SessionUnavailableException(
-        'No v4 Double Ratchet session — peer PreKeyBundle required.',
+        'Local identity keys not initialized — cannot perform X3DH handshake.',
       );
     }
 
     try {
-      return await session.encrypt(plaintext);
+      final bundleMap = jsonDecode(peerPreKeyBundleJson) as Map<String, dynamic>;
+      final bundle    = PreKeyBundle.fromJson(bundleMap);
+
+      // Perform X3DH initiator handshake
+      final x3dhResult = await X3dhService.initiatorHandshake(
+        ikADh:   ikADh,
+        bundleB: bundle,
+      );
+
+      // Initialize Double Ratchet session as Alice (initiator)
+      final session = await DoubleRatchetSession.initAlice(
+        conversationId:           conversationId,
+        peerIdentityPublicKeyB64: base64Encode(bundle.ikPubDh),
+        sk:                       x3dhResult.sharedSecret,
+        bobSpkPub:                bundle.spkPub,
+      );
+
+      _v4Sessions[conversationId] = session;
+
+      // Encrypt the first message with the new ratchet session
+      final firstMessage = await session.encrypt(plaintext);
+
+      // Wrap in HandshakeInitEnvelope
+      final envelope = HandshakeInitEnvelope(
+        ikEd:         base64Decode(identityService.identityEdPublicKeyB64!),
+        ikDh:         base64Decode(identityService.identityDhPublicKeyB64!),
+        ek:           x3dhResult.ekPub,
+        opkIdUsed:    x3dhResult.opkId,
+        firstMessage: firstMessage,
+      );
+
+      return jsonEncode(envelope.toJson());
+    } on X3dhException catch (e) {
+      throw SessionUnavailableException('X3DH initiator handshake failed: ${e.reason}');
     } on RatchetException catch (e) {
-      throw SessionUnavailableException('v4 encryption failed: ${e.reason}');
+      throw SessionUnavailableException('Double Ratchet initialization failed: ${e.reason}');
+    } catch (e) {
+      throw SessionUnavailableException('v4 handshake init failed for $conversationId: $e');
     }
   }
 
-  /// Decrypts a `"kamui_v4:..."` payload using the **v4 Double Ratchet**.
-  ///
-  /// Handles:
-  /// - Normal in-order messages (symmetric ratchet advance)
-  /// - Out-of-order messages (skipped key store lookup)
-  /// - New DH epoch messages (full DH ratchet step)
+  /// Decrypts a v4 payload (either [HandshakeInitEnvelope] JSON or `"kamui_v4:..."`).
   ///
   /// Returns the plaintext or throws [SessionUnavailableException].
   Future<String> decryptV4(
@@ -238,6 +300,73 @@ class SessionManager {
     String wirePayload, {
     String? peerPreKeyBundleJson,
   }) async {
+    final identityService = _getIdentityService();
+    if (!identityService.isInitialized) {
+      await identityService.init();
+    }
+
+    // 1. Check if wirePayload is a HandshakeInitEnvelope
+    if (HandshakeInitEnvelope.isHandshakeEnvelope(wirePayload)) {
+      try {
+        final decodedMap = jsonDecode(wirePayload.trim()) as Map<String, dynamic>;
+        final envelope   = HandshakeInitEnvelope.fromJson(decodedMap);
+
+        final ikBDh = identityService.ikDhKeyPair;
+        final spkB  = identityService.spkKeyPair;
+        if (ikBDh == null || spkB == null) {
+          throw const SessionUnavailableException(
+            'Local identity keys (IK_dh, SPK) not initialized for receiver handshake.',
+          );
+        }
+
+        // Look up OPK if used (fails closed on replay or invalid OPK ID)
+        SimpleKeyPair? opkB;
+        if (envelope.opkIdUsed != null) {
+          try {
+            opkB = identityService.getOpk(envelope.opkIdUsed!);
+          } on X3dhException catch (e) {
+            throw SessionUnavailableException('OPK validation failed (replay or invalid): ${e.reason}');
+          }
+        }
+
+        // Derive shared secret as Bob
+        final sharedSecret = await X3dhService.responderHandshake(
+          ikBDh:    ikBDh,
+          spkB:     spkB,
+          opkB:     opkB,
+          ekAPub:   envelope.ek,
+          ikADhPub: envelope.ikDh,
+        );
+
+        // Consume OPK immediately upon successful cryptographic derivation
+        if (envelope.opkIdUsed != null) {
+          await identityService.consumeOpk(envelope.opkIdUsed!);
+        }
+
+        // Initialize Double Ratchet session as Bob (receiver)
+        final bobSession = await DoubleRatchetSession.initBob(
+          conversationId:           conversationId,
+          peerIdentityPublicKeyB64: base64Encode(envelope.ikDh),
+          sk:                       sharedSecret,
+          spkBDh:                   spkB,
+        );
+
+        _v4Sessions[conversationId] = bobSession;
+
+        // Decrypt the first message embedded in the envelope
+        return await bobSession.decrypt(envelope.firstMessage);
+      } on SessionUnavailableException {
+        rethrow;
+      } on X3dhException catch (e) {
+        throw SessionUnavailableException('X3DH responder handshake failed: ${e.reason}');
+      } on RatchetException catch (e) {
+        throw SessionUnavailableException('Double Ratchet decryption failed: ${e.reason}');
+      } catch (e) {
+        throw SessionUnavailableException('Handshake envelope processing failed: $e');
+      }
+    }
+
+    // 2. Normal established session message ("kamui_v4:...")
     DoubleRatchetSession? session = _v4Sessions[conversationId];
     if (session == null && peerPreKeyBundleJson != null && peerPreKeyBundleJson.isNotEmpty) {
       session = await getOrCreateV4Session(

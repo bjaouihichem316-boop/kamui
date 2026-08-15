@@ -16,6 +16,7 @@ import '../services/identity_key_service.dart';
 import '../services/notification_service.dart';
 import '../services/sam_service.dart';
 import '../services/session_manager.dart';
+import '../services/x3dh_service.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INFRASTRUCTURE PROVIDERS
@@ -214,7 +215,8 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
 
       // Route payload through v4 Double Ratchet decryption (or legacy v2 fallback)
       String? decryptedPlaintext;
-      if (encryptedPayload.startsWith('kamui_v4:')) {
+      final isHandshakeInit = HandshakeInitEnvelope.isHandshakeEnvelope(encryptedPayload);
+      if (encryptedPayload.startsWith('kamui_v4:') || isHandshakeInit) {
         try {
           decryptedPlaintext = await ref.read(sessionManagerProvider).decryptV4(
             targetConv.id,
@@ -241,7 +243,7 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
       // If decryption succeeded: store plaintext (MessageRepository encrypts it locally with AES before saving).
       // If decryption failed: store explicit fallback string.
       final messageText = decryptedPlaintext ??
-          (encryptedPayload.startsWith('kamui_v')
+          (encryptedPayload.startsWith('kamui_v') || isHandshakeInit
               ? '[Encrypted payload - Decryption failed]'
               : encryptedPayload);
 

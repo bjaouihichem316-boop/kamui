@@ -21,7 +21,19 @@ import 'x3dh_service.dart';
 class IdentityKeyService {
   static final IdentityKeyService _instance = IdentityKeyService._internal();
   factory IdentityKeyService() => _instance;
-  IdentityKeyService._internal();
+
+  final FlutterSecureStorage _secureStorage;
+
+  IdentityKeyService._internal({FlutterSecureStorage? secureStorage})
+      : _secureStorage = secureStorage ?? const FlutterSecureStorage(
+          aOptions: AndroidOptions(encryptedSharedPreferences: true),
+          iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+        );
+
+  /// Factory for isolated instances in tests or multi-identity scenarios.
+  factory IdentityKeyService.isolated({FlutterSecureStorage? secureStorage}) {
+    return IdentityKeyService._internal(secureStorage: secureStorage);
+  }
 
   // ─── Storage key aliases ──────────────────────────────────────────────────
   static const _ikEdPrivAlias  = 'kamui_ik_ed25519_priv';
@@ -38,11 +50,6 @@ class IdentityKeyService {
   // ─── Algorithms ──────────────────────────────────────────────────────────
   final _ed25519 = Ed25519();
   final _x25519  = X25519();
-
-  final _secureStorage = const FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
-    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
-  );
 
   // ─── In-memory state ──────────────────────────────────────────────────────
   SimpleKeyPair? _ikEdKeyPair;   // Ed25519 identity (signing)

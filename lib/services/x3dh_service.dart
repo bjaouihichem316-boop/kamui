@@ -85,6 +85,73 @@ class X3dhResult {
   });
 }
 
+/// Envelope transmitted on the wire for the initial message of a v4 conversation.
+///
+/// Contains Alice's public parameters (Ed25519 identity key, X25519 DH identity key,
+/// ephemeral public key, and consumed OPK identifier) along with the first
+/// Double-Ratchet-encrypted payload. This gives Bob all information required
+/// to compute the X3DH shared secret and initialize his receiver ratchet state.
+class HandshakeInitEnvelope {
+  static const String envelopeType = 'kamui_v4_handshake_init';
+
+  /// Alice's Ed25519 identity public key (32 bytes).
+  final List<int> ikEd;
+
+  /// Alice's X25519 DH identity public key (32 bytes).
+  final List<int> ikDh;
+
+  /// Alice's ephemeral X25519 public key (32 bytes).
+  final List<int> ek;
+
+  /// The OPK ID used in DH4 if OPK was present in Bob's bundle.
+  final int? opkIdUsed;
+
+  /// The first Double-Ratchet-encrypted message payload (`"kamui_v4:<header>:<nonce>:<ct>"`).
+  final String firstMessage;
+
+  const HandshakeInitEnvelope({
+    required this.ikEd,
+    required this.ikDh,
+    required this.ek,
+    this.opkIdUsed,
+    required this.firstMessage,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'type': envelopeType,
+    'ik_ed': base64Encode(ikEd),
+    'ik_dh': base64Encode(ikDh),
+    'ek': base64Encode(ek),
+    if (opkIdUsed != null) 'opk_id_used': opkIdUsed,
+    'first_message': firstMessage,
+  };
+
+  factory HandshakeInitEnvelope.fromJson(Map<String, dynamic> json) {
+    if (json['type'] != envelopeType) {
+      throw FormatException('Invalid HandshakeInitEnvelope type: ${json['type']}');
+    }
+    return HandshakeInitEnvelope(
+      ikEd: base64Decode(json['ik_ed'] as String),
+      ikDh: base64Decode(json['ik_dh'] as String),
+      ek: base64Decode(json['ek'] as String),
+      opkIdUsed: json['opk_id_used'] as int?,
+      firstMessage: json['first_message'] as String,
+    );
+  }
+
+  /// Helper to check if a wire payload is a HandshakeInitEnvelope.
+  static bool isHandshakeEnvelope(String payload) {
+    final trimmed = payload.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return false;
+    try {
+      final decoded = jsonDecode(trimmed);
+      return decoded is Map<String, dynamic> && decoded['type'] == envelopeType;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // X3DH Service
 // ══════════════════════════════════════════════════════════════════════════════
