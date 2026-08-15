@@ -74,9 +74,9 @@ class CryptoService {
     final output   = Uint8List(cipher.getOutputSize(pt.length));
     var offset = 0;
     offset += cipher.processBytes(pt, 0, pt.length, output, offset);
-    cipher.doFinal(output, offset);
+    offset += cipher.doFinal(output, offset);
 
-    return '${base64Encode(nonce)}:${base64Encode(output)}';
+    return '${base64Encode(nonce)}:${base64Encode(output.sublist(0, offset))}';
   }
 
   /// Decrypts a value produced by [encrypt].
@@ -100,12 +100,17 @@ class CryptoService {
       final output = Uint8List(cipher.getOutputSize(ct.length));
       var offset   = 0;
       offset += cipher.processBytes(ct, 0, ct.length, output, offset);
-      cipher.doFinal(output, offset);
+      offset += cipher.doFinal(output, offset);
 
-      return utf8.decode(output.sublist(0, output.length));
+      return utf8.decode(output.sublist(0, offset));
     } catch (_) {
       return null;
     }
+  }
+
+  /// Resets in-memory cached key (for test isolation).
+  void resetForTesting() {
+    _cachedKey = null;
   }
 
   /// Whether the service has been initialized with a key.

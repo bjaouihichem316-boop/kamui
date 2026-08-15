@@ -114,7 +114,8 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
     final msg = Message(
       id:             '${now.millisecondsSinceEpoch}',
       conversationId: widget.conversation.id,
-      text:           text,
+      text:           encryptedPayload, // SECURITY INVARIANT: Persist encrypted wire payload
+      decryptedText:  text,             // Transient in-memory plaintext for UI
       timestamp:      now,
       isSent:         true,
       isEncrypted:    true,
@@ -226,7 +227,7 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
                         itemBuilder: (_, i) {
                           final m = messages[i];
                           return ChatBubble(
-                            message:           m.text,
+                            message:           m.displayText,
                             time:              m.formattedTime,
                             isSent:            m.isSent,
                             isEncrypted:       m.isEncrypted,

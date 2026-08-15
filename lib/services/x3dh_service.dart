@@ -29,6 +29,9 @@ class PreKeyBundle {
   /// Prevents MITM key substitution attacks.
   final List<int> spkSig;
 
+  /// Explicit One-Time PreKey identifier.
+  final int? opkId;
+
   /// X25519 One-Time PreKey (32 bytes). Optional — omitted when pool is exhausted.
   final List<int>? opkPub;
 
@@ -37,6 +40,7 @@ class PreKeyBundle {
     required this.ikPubDh,
     required this.spkPub,
     required this.spkSig,
+    this.opkId,
     this.opkPub,
   });
 
@@ -45,6 +49,7 @@ class PreKeyBundle {
     'ik_dh':   base64Encode(ikPubDh),
     'spk':     base64Encode(spkPub),
     'spk_sig': base64Encode(spkSig),
+    if (opkId != null) 'opk_id': opkId,
     if (opkPub != null) 'opk': base64Encode(opkPub!),
   };
 
@@ -54,6 +59,7 @@ class PreKeyBundle {
       ikPubDh: base64Decode(json['ik_dh']   as String),
       spkPub:  base64Decode(json['spk']     as String),
       spkSig:  base64Decode(json['spk_sig'] as String),
+      opkId:   json['opk_id'] as int?,
       opkPub:  json['opk'] != null
                ? base64Decode(json['opk'] as String)
                : null,
@@ -69,7 +75,14 @@ class X3dhResult {
   /// Alice's ephemeral X25519 public key — MUST be sent to Bob in the wire header.
   final List<int> ekPub;
 
-  const X3dhResult({required this.sharedSecret, required this.ekPub});
+  /// The OPK ID used in DH4 if OPK was present in the bundle.
+  final int? opkId;
+
+  const X3dhResult({
+    required this.sharedSecret,
+    required this.ekPub,
+    this.opkId,
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -145,15 +158,21 @@ class X3dhService {
 
     // DH4 = X25519(EK_A_priv, OPK_B_pub) — one-time FS [optional]
     List<int>? dh4;
+    int? usedOpkId;
     if (bundleB.opkPub != null) {
       final opkBPub = SimplePublicKey(bundleB.opkPub!, type: KeyPairType.x25519);
       dh4 = await _dh(ekA, opkBPub);
+      usedOpkId = bundleB.opkId ?? 1;
     }
 
     // 5. Derive shared secret
     final sk = await _hkdf([...dh1, ...dh2, ...dh3, ...?dh4]);
 
-    return X3dhResult(sharedSecret: sk, ekPub: ekAPub.bytes);
+    return X3dhResult(
+      sharedSecret: sk,
+      ekPub:        ekAPub.bytes,
+      opkId:        usedOpkId,
+    );
   }
 
   /// **Bob (Responder)** mirrors Alice's DH operations to derive the identical SK.

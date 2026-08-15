@@ -213,10 +213,10 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
       }
 
       // Route payload through v4 Double Ratchet decryption (or legacy v2 fallback)
-      String messageText = encryptedPayload;
+      String? decryptedPlaintext;
       if (encryptedPayload.startsWith('kamui_v4:')) {
         try {
-          messageText = await ref.read(sessionManagerProvider).decryptV4(
+          decryptedPlaintext = await ref.read(sessionManagerProvider).decryptV4(
             targetConv.id,
             encryptedPayload,
             peerPreKeyBundleJson: targetConv.contact.preKeyBundleJson,
@@ -233,15 +233,18 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
             peerPreKeyBundleJson: targetConv.contact.preKeyBundleJson,
           );
           if (dec != null) {
-            messageText = dec;
+            decryptedPlaintext = dec;
           }
         } catch (_) {}
       }
 
+      // SECURITY INVARIANT: Message.text MUST ALWAYS store the wire encrypted payload.
+      // decryptedText is transient and kept in memory only for UI display.
       final incomingMsg = Message(
         id:             'msg_in_${DateTime.now().millisecondsSinceEpoch}',
         conversationId: targetConv.id,
-        text:           messageText,
+        text:           encryptedPayload,  // Encrypted wire payload persisted to SQLite
+        decryptedText:  decryptedPlaintext, // In-memory only
         timestamp:      DateTime.now(),
         isSent:         false,
         isEncrypted:    true,

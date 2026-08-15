@@ -8,7 +8,14 @@ enum MessageStatus { sending, sent, delivered, failed }
 class Message {
   final String id;
   final String conversationId;
+
+  /// The persisted payload string (wire ciphertext or stored encrypted value).
+  /// SECURITY INVARIANT: For network messages, this holds the wire payload.
   final String text;
+
+  /// Transient, in-memory decrypted plaintext (NEVER persisted to disk directly).
+  final String? decryptedText;
+
   final DateTime timestamp;
 
   /// true = sent by us, false = received from peer.
@@ -29,6 +36,7 @@ class Message {
     required this.id,
     required this.conversationId,
     required this.text,
+    this.decryptedText,
     required this.timestamp,
     required this.isSent,
     this.isEncrypted = true,
@@ -36,6 +44,10 @@ class Message {
     this.ttlSeconds,
     this.expiresAt,
   });
+
+  /// The text to display in the UI — prefers transient [decryptedText] when available,
+  /// falling back to [text].
+  String get displayText => decryptedText ?? text;
 
   /// Whether the message has passed its TTL expiration timestamp.
   bool get isExpired =>
@@ -61,6 +73,7 @@ class Message {
     String? id,
     String? conversationId,
     String? text,
+    String? decryptedText,
     DateTime? timestamp,
     bool? isSent,
     bool? isEncrypted,
@@ -72,6 +85,7 @@ class Message {
       id:             id ?? this.id,
       conversationId: conversationId ?? this.conversationId,
       text:           text ?? this.text,
+      decryptedText:  decryptedText ?? this.decryptedText,
       timestamp:      timestamp ?? this.timestamp,
       isSent:         isSent ?? this.isSent,
       isEncrypted:    isEncrypted ?? this.isEncrypted,
