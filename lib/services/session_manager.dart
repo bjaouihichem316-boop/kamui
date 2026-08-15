@@ -99,6 +99,56 @@ class SessionManager {
 
   // ── Session establishment ─────────────────────────────────────────────────
 
+  /// Initiates a v4 Double Ratchet session as Sender (Alice) using [peerPreKeyBundleJson].
+  Future<DoubleRatchetSession> initiateSessionV4(
+    String conversationId, {
+    required String peerPreKeyBundleJson,
+  }) async {
+    final session = await getOrCreateV4Session(
+      conversationId,
+      peerPreKeyBundleJson: peerPreKeyBundleJson,
+    );
+    if (session == null) {
+      throw const SessionUnavailableException(
+        'Failed to initiate v4 Double Ratchet session — check PreKeyBundle.',
+      );
+    }
+    return session;
+  }
+
+  /// Accepts / establishes a v4 Double Ratchet session as Receiver (Bob).
+  Future<DoubleRatchetSession> acceptSessionV4(
+    String conversationId, {
+    required String peerIdentityPublicKeyB64,
+    required Uint8List sharedSecret,
+  }) async {
+    if (_v4Sessions.containsKey(conversationId)) {
+      return _v4Sessions[conversationId]!;
+    }
+
+    final identityService = IdentityKeyService();
+    if (!identityService.isInitialized) {
+      await identityService.init();
+    }
+
+    final spkKp = identityService.spkKeyPair;
+    if (spkKp == null) {
+      throw const SessionUnavailableException(
+        'Local SPK keypair not initialized — cannot accept v4 session.',
+      );
+    }
+
+    final session = await DoubleRatchetSession.initBob(
+      conversationId:           conversationId,
+      peerIdentityPublicKeyB64: peerIdentityPublicKeyB64,
+      sk:                       sharedSecret,
+      spkBDh:                   spkKp,
+    );
+
+    _v4Sessions[conversationId] = session;
+    return session;
+  }
+
   /// Retrieves or establishes a **v4 Double Ratchet** session for [conversationId].
   ///
   /// Requires [peerPreKeyBundleJson] (v3 JSON from [IdentityKeyService.parseHandshakePayload]).
@@ -152,12 +202,15 @@ class SessionManager {
   Future<String> encryptV4(
     String conversationId,
     String plaintext, {
-    required String peerPreKeyBundleJson,
+    String? peerPreKeyBundleJson,
   }) async {
-    final session = await getOrCreateV4Session(
-      conversationId,
-      peerPreKeyBundleJson: peerPreKeyBundleJson,
-    );
+    DoubleRatchetSession? session = _v4Sessions[conversationId];
+    if (session == null && peerPreKeyBundleJson != null && peerPreKeyBundleJson.isNotEmpty) {
+      session = await getOrCreateV4Session(
+        conversationId,
+        peerPreKeyBundleJson: peerPreKeyBundleJson,
+      );
+    }
 
     if (session == null) {
       throw const SessionUnavailableException(
@@ -183,12 +236,15 @@ class SessionManager {
   Future<String> decryptV4(
     String conversationId,
     String wirePayload, {
-    required String peerPreKeyBundleJson,
+    String? peerPreKeyBundleJson,
   }) async {
-    final session = await getOrCreateV4Session(
-      conversationId,
-      peerPreKeyBundleJson: peerPreKeyBundleJson,
-    );
+    DoubleRatchetSession? session = _v4Sessions[conversationId];
+    if (session == null && peerPreKeyBundleJson != null && peerPreKeyBundleJson.isNotEmpty) {
+      session = await getOrCreateV4Session(
+        conversationId,
+        peerPreKeyBundleJson: peerPreKeyBundleJson,
+      );
+    }
 
     if (session == null) {
       throw const SessionUnavailableException(

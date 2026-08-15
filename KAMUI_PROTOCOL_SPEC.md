@@ -191,9 +191,9 @@ When a **Duress PIN** is entered, Kamui performs a **defense-in-depth local stor
 | :--- | :--- | :---: | :--- |
 | **Metadata Protection** | `NotificationService` & `providers.dart` | ✅ Implemented | Zero plain/sender data in `show()` |
 | **Static Code Integrity** | `flutter analyze` | ✅ Implemented | `No issues found!` |
-| **Envelope Schema** | `KAMUI_PROTOCOL_SPEC.md` | ✅ Implemented | Protocol specification published |
-| **Fail-Closed Encryption** | `SessionManager.encryptMessage()` | ✅ Implemented | Throws `SessionUnavailableException`; no silent downgrade |
+| **Fail-Closed Encryption** | `SessionManager.encryptV4()` & `encryptMessage()` | ✅ Implemented (Live) | Throws `SessionUnavailableException`; no silent downgrade |
+| **Full X3DH Key Agreement** | `X3dhService` & `SessionManager` | ✅ Implemented (Live) | Authenticated 3-DH / 4-DH with Ed25519 SPK verification |
+| **Double Ratchet Engine** | `DoubleRatchetSession` & `SessionManager` | ✅ Implemented (Live) | DH ratchet + symmetric KDF + candidate state rollback |
+| **Skipped Key Store (Anti-DoS)** | `SkippedKeyStore` | ✅ Implemented (Live) | Peek ➔ Authenticate ➔ Consume pattern with max skip bound |
+| **Prekey Bundle QR Handshake** | `IdentityKeyService` & `QrShareDialog` | ✅ Implemented (Live) | Embeds full v3 PreKeyBundle in QR payload |
 | **Duress Wipe (Defense-in-Depth)** | DB + `flutter_secure_storage` erase | ✅ Implemented | Local storage & key wipe on duress PIN |
-| **Full X3DH Key Agreement** | `SessionManager` | 🗺️ Planned | Roadmap v3 — single X25519 DH in current impl |
-| **Double Ratchet (Signal-spec)** | `SessionState` | 🗺️ Planned | Roadmap v3 — symmetric-only ratchet currently |
-| **Binary Wire Envelope** | `SAMService` transport layer | 🗺️ Planned | Roadmap v3 — text prefix format currently |

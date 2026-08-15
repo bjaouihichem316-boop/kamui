@@ -72,15 +72,26 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
     if (text.isEmpty) return;
 
     // ── Fail-Closed Encryption (Security Requirement) ─────────────────────
-    // encryptMessage() throws SessionUnavailableException if a session cannot
-    // be established. No silent fallback to weaker encryption is permitted.
+    // encryptV4() / encryptMessage() throws SessionUnavailableException if a
+    // session cannot be established. No silent fallback to weaker encryption is permitted.
     final String encryptedPayload;
     try {
-      encryptedPayload = await ref.read(sessionManagerProvider).encryptMessage(
-        widget.conversation.id,
-        text,
-        peerIdentityPublicKeyB64: widget.conversation.contact.identityPublicKey,
-      );
+      final sessionManager = ref.read(sessionManagerProvider);
+      final bundle = widget.conversation.contact.preKeyBundleJson;
+      if (bundle != null && bundle.isNotEmpty) {
+        encryptedPayload = await sessionManager.encryptV4(
+          widget.conversation.id,
+          text,
+          peerPreKeyBundleJson: bundle,
+        );
+      } else {
+        encryptedPayload = await sessionManager.encryptMessage(
+          widget.conversation.id,
+          text,
+          peerIdentityPublicKeyB64: widget.conversation.contact.identityPublicKey,
+          peerPreKeyBundleJson: bundle,
+        );
+      }
     } on SessionUnavailableException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(

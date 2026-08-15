@@ -212,12 +212,36 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
         await ref.read(conversationsProvider.notifier).addAndPersist(targetConv);
       }
 
-      // Store the encrypted wire payload in DB — never plaintext-at-rest.
-      // decryptedText is only used transiently for in-memory display logic.
+      // Route payload through v4 Double Ratchet decryption (or legacy v2 fallback)
+      String messageText = encryptedPayload;
+      if (encryptedPayload.startsWith('kamui_v4:')) {
+        try {
+          messageText = await ref.read(sessionManagerProvider).decryptV4(
+            targetConv.id,
+            encryptedPayload,
+            peerPreKeyBundleJson: targetConv.contact.preKeyBundleJson,
+          );
+        } catch (_) {
+          // If session is not yet synchronized, retain payload for out-of-order recovery
+        }
+      } else if (encryptedPayload.startsWith('kamui_v2:')) {
+        try {
+          final dec = await ref.read(sessionManagerProvider).decryptMessage(
+            targetConv.id,
+            encryptedPayload,
+            peerIdentityPublicKeyB64: targetConv.contact.identityPublicKey,
+            peerPreKeyBundleJson: targetConv.contact.preKeyBundleJson,
+          );
+          if (dec != null) {
+            messageText = dec;
+          }
+        } catch (_) {}
+      }
+
       final incomingMsg = Message(
         id:             'msg_in_${DateTime.now().millisecondsSinceEpoch}',
         conversationId: targetConv.id,
-        text:           encryptedPayload,   // Encrypted at rest — decrypted on read
+        text:           messageText,
         timestamp:      DateTime.now(),
         isSent:         false,
         isEncrypted:    true,

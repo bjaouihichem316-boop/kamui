@@ -68,25 +68,21 @@ This table provides full transparency on what is currently implemented in the co
 
 | Feature / Property | Status | Implementation Notes |
 | :--- | :---: | :--- |
-| **AES-256-GCM message encryption** (`CryptoService`) | ✅ Implemented | `lib/services/crypto_service.dart` — PointyCastle, per-message random nonce |
-| **X25519 Long-Term Identity Keypair** (`IdentityKeyService`) | ✅ Implemented | `lib/services/identity_key_service.dart` — stored in `flutter_secure_storage` |
-| **Session Key Derivation (X25519 + SHA-256 domain label)** | ✅ Implemented | `lib/services/session_manager.dart` — `Kamui-Session-v2` domain separation |
-| **Ratcheted Message Keys (4-byte counter)** | ✅ Implemented | `SessionState.getNextSendKey()` / `peekReceiveKey()` — overflow-safe 32-bit LE |
-| **Fail-Closed Encryption (no silent downgrade)** | ✅ Implemented | `encryptMessage()` throws `SessionUnavailableException` — no fallback path |
+| **AES-256-GCM message encryption** (`CryptoService`) | ✅ Implemented | `lib/services/crypto_service.dart` — PointyCastle & Cryptography, per-message random nonce |
+| **X25519 & Ed25519 Identity Keyset** (`IdentityKeyService`) | ✅ Implemented | `lib/services/identity_key_service.dart` — stored in `flutter_secure_storage` (IK_ed, IK_dh, SPK, OPK) |
+| **Full X3DH Key Agreement (DH1–DH4 + HKDF-SHA256)** | ✅ Implemented (Live) | `lib/services/x3dh_service.dart` — Mutual auth with Ed25519 SPK verification & forward secrecy |
+| **Double Ratchet Engine (DH + Symmetric Ratchet)** | ✅ Implemented (Live) | `lib/services/double_ratchet.dart` — Transactional candidate state & rollback on MAC failure |
+| **Prekey Bundle Infrastructure & QR Handshake** | ✅ Implemented (Live) | `lib/services/identity_key_service.dart` & `lib/widgets/qr_share_dialog.dart` — v3 PreKeyBundle payload |
+| **Out-of-Order Skipped Keys Caching (Anti-DoS)** | ✅ Implemented (Live) | `lib/services/double_ratchet.dart` — Peek ➔ Authenticate ➔ Consume pattern with TTL & max skip bounds |
+| **Fail-Closed E2EE Encryption (no silent downgrade)** | ✅ Implemented (Live) | `SessionManager.encryptV4()` & `chat_room_screen.dart` — Throws `SessionUnavailableException` on failure |
+| **Live v4 Wire Transport & Decryption** | ✅ Implemented (Live) | `kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>` with live stream decryption in `providers.dart` |
 | **I2P SAM v3.3 STREAM Transport** | ✅ Implemented | `lib/services/sam_service.dart` — TCP socket to `127.0.0.1:7656` |
 | **OS Notification Metadata Isolation** | ✅ Implemented | `lib/services/notification_service.dart` — generic title/body only |
-| **QR Code v2 Handshake Payload** (`id_pub` field) | ✅ Implemented | `lib/widgets/qr_share_dialog.dart` — JSON `{v:2, dest, id_pub}` |
 | **Self-Destruct TTL Messages** | ✅ Implemented | `lib/models/message.dart` — configurable expiry + DB purge |
 | **Duress PIN → Defense-in-depth local storage & key wipe** | ✅ Implemented | DB + secure storage wipe on duress PIN entry |
 | **Biometric / PIN Lock Gate** | ✅ Implemented | Platform local auth on app resume |
-| **Full X3DH Key Agreement (DH1–DH4 + HKDF)** | 🗺️ Planned | Roadmap v3 — current session uses single X25519 DH + SHA-256 KDF |
-| **Double Ratchet (DH + Symmetric chain, Signal-spec)** | 🗺️ Planned | Roadmap v3 — current ratchet is symmetric-only (counter-based) |
-| **Prekey Bundle Infrastructure (SPK, OPK pool)** | 🗺️ Planned | Roadmap v3 — requires server-side or DHT prekey registry |
-| **Out-of-Order Message Key Caching** | 🗺️ Planned | Roadmap v3 — skipped key store with 7-day TTL |
-| **Ed25519 Message Signatures** | 🗺️ Planned | Roadmap v3 — `sig` field defined in spec, not yet validated |
-| **Binary Envelope Wire Format (version byte + flags)** | 🗺️ Planned | Roadmap v3 — current wire is `kamui_v2:nonce_b64:ct_b64` text prefix |
 
-> **Legend**: ✅ Implemented = verifiable in current `main` branch source code. 🗺️ Planned = documented in `KAMUI_PROTOCOL_SPEC.md` as a design target for a future release.
+> **Legend**: ✅ Implemented = verifiable in current `main` branch source code. All v4 (X3DH + Double Ratchet) components are active and live.
 
 ---
 

@@ -8,6 +8,7 @@ import '../core/providers.dart';
 import '../models/contact.dart';
 import '../models/conversation.dart';
 import '../models/message.dart';
+import '../services/identity_key_service.dart';
 import '../widgets/hud_background.dart';
 import '../widgets/kamui_button.dart';
 import 'qr_scan_screen.dart';
@@ -82,23 +83,41 @@ class _AddFriendScreenState extends ConsumerState<AddFriendScreen>
     await Future<void>.delayed(const Duration(milliseconds: 800)); // simulate handshake
 
     final name    = _nameController.text.trim();
-    final dest    = _destController.text.trim();
+    final rawDest = _destController.text.trim();
     final initial = name.isNotEmpty ? name[0].toUpperCase() : '?';
     final id      = 'c_${DateTime.now().millisecondsSinceEpoch}';
     final convId  = 'conv_$id';
 
+    // Parse Handshake Payload (v3 PreKeyBundle / v2 ID key / raw destination)
+    final parsed     = IdentityKeyService().parseHandshakePayload(rawDest);
+    final dest       = parsed['destination']!.isNotEmpty ? parsed['destination']! : rawDest;
+    final idPub      = parsed['identityPublicKey']?.isNotEmpty == true ? parsed['identityPublicKey'] : null;
+    final bundleJson = parsed['preKeyBundle']?.isNotEmpty == true ? parsed['preKeyBundle'] : null;
+
     final contact = Contact(
-      id:            id,
-      name:          name,
-      destination:   dest,
-      avatarInitial: initial,
-      status:        ContactStatus.building,
+      id:                id,
+      name:              name,
+      destination:       dest,
+      identityPublicKey: idPub,
+      preKeyBundleJson:  bundleJson,
+      avatarInitial:     initial,
+      status:            ContactStatus.building,
     );
+
+    // Pre-establish v4 Double Ratchet session if PreKeyBundle is provided
+    if (bundleJson != null && bundleJson.isNotEmpty) {
+      try {
+        await ref.read(sessionManagerProvider).initiateSessionV4(
+          convId,
+          peerPreKeyBundleJson: bundleJson,
+        );
+      } catch (_) {}
+    }
 
     final welcomeMsg = Message(
       id:             'msg_${DateTime.now().millisecondsSinceEpoch}',
       conversationId: convId,
-      text:           '🔐 Secure channel opened with $name. Tunnel building…',
+      text:           '🔐 Secure v4 channel opened with $name. Tunnel building…',
       timestamp:      DateTime.now(),
       isSent:         false,
     );

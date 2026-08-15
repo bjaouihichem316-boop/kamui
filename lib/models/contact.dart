@@ -26,6 +26,9 @@ class Contact {
   /// Optional X25519 identity public key (Base64) for E2EE session agreement.
   final String? identityPublicKey;
 
+  /// Optional PreKeyBundle JSON string for v4 X3DH + Double Ratchet session agreement.
+  final String? preKeyBundleJson;
+
   /// Single character initial for the avatar display.
   final String avatarInitial;
 
@@ -37,6 +40,7 @@ class Contact {
     required this.name,
     required this.destination,
     this.identityPublicKey,
+    this.preKeyBundleJson,
     required this.avatarInitial,
     this.status = ContactStatus.offline,
     this.lastSeen,
@@ -54,6 +58,7 @@ class Contact {
     String? name,
     String? destination,
     String? identityPublicKey,
+    String? preKeyBundleJson,
     String? avatarInitial,
     ContactStatus? status,
     DateTime? lastSeen,
@@ -63,6 +68,7 @@ class Contact {
       name: name ?? this.name,
       destination: destination ?? this.destination,
       identityPublicKey: identityPublicKey ?? this.identityPublicKey,
+      preKeyBundleJson: preKeyBundleJson ?? this.preKeyBundleJson,
       avatarInitial: avatarInitial ?? this.avatarInitial,
       status: status ?? this.status,
       lastSeen: lastSeen ?? this.lastSeen,

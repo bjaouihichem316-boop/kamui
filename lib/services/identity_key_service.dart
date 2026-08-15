@@ -53,6 +53,7 @@ class IdentityKeyService {
   String? _ikEdPubB64;
   String? _ikDhPubB64;
   String? _spkPubB64;
+  String? _opkPubB64;
 
   bool _isInitialized = false;
   bool get isInitialized => _isInitialized;
@@ -133,6 +134,7 @@ class IdentityKeyService {
           publicKey: SimplePublicKey(base64Decode(opkPubB64), type: KeyPairType.x25519),
           type: KeyPairType.x25519,
         );
+        _opkPubB64 = opkPubB64;
       }
     } else {
       await _generateFullKeyset();
@@ -186,6 +188,7 @@ class IdentityKeyService {
     _spkPubB64    = base64Encode(spkPub.bytes);
     _spkSigBytes  = spkSig.bytes;
     _opkKeyPair   = opkKP;
+    _opkPubB64    = base64Encode(opkPub.bytes);
   }
 
   /// Force-generates a new complete keyset (e.g. duress wipe, key rotation).
@@ -211,7 +214,7 @@ class IdentityKeyService {
       ikPubDh: base64Decode(dhPubB64),
       spkPub:  base64Decode(spPubB64),
       spkSig:  spkSig,
-      opkPub:  null, // OPK resolved asynchronously — see generatePreKeyBundleAsync()
+      opkPub:  _opkPubB64 != null ? base64Decode(_opkPubB64!) : null,
     );
   }
 
@@ -285,6 +288,7 @@ class IdentityKeyService {
       'ik_dh':   _ikDhPubB64,
       'spk':     _spkPubB64,
       'spk_sig': base64Encode(_spkSigBytes!),
+      if (_opkPubB64 != null) 'opk': _opkPubB64,
     });
   }
 
@@ -358,6 +362,7 @@ class IdentityKeyService {
     _ikEdPubB64   = null;
     _ikDhPubB64   = null;
     _spkPubB64    = null;
+    _opkPubB64    = null;
     _isInitialized = false;
   }
 }
