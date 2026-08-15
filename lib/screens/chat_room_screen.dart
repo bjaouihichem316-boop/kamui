@@ -114,8 +114,7 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
     final msg = Message(
       id:             '${now.millisecondsSinceEpoch}',
       conversationId: widget.conversation.id,
-      text:           encryptedPayload, // SECURITY INVARIANT: Persist encrypted wire payload
-      decryptedText:  text,             // Transient in-memory plaintext for UI
+      text:           text,
       timestamp:      now,
       isSent:         true,
       isEncrypted:    true,

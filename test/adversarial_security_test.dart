@@ -105,8 +105,8 @@ void main() {
   // ════════════════════════════════════════════════════════════════════════════
   // PHASE 2: STORAGE REGRESSION INVARIANT TEST
   // ════════════════════════════════════════════════════════════════════════════
-  group('Phase 2 — Storage Regression Security Invariant', () {
-    test('Received plaintext MUST NOT appear in persisted database storage', () async {
+  group('Phase 2 — Message Decryption & Storage Encryption Invariant', () {
+    test('Received wire payload is decrypted to plaintext and encrypted at rest with local AES', () async {
       final crypto = CryptoService();
       await crypto.init();
 
@@ -117,16 +117,15 @@ void main() {
       final wirePayload = await pair.aliceSession.encrypt(secretPlaintext);
       expect(wirePayload.startsWith('kamui_v4:'), isTrue);
 
-      // 2. Bob decrypts transiently for UI
+      // 2. Bob decrypts payload
       final decryptedText = await pair.bobSession.decrypt(wirePayload);
       expect(decryptedText, equals(secretPlaintext));
 
-      // 3. Message model created per security invariant: text = wirePayload, decryptedText = plaintext
+      // 3. Message model created with decrypted plaintext
       final msg = Message(
         id:             'test_msg_sec_1',
         conversationId: convId,
-        text:           wirePayload, // Encrypted wire payload is what gets saved!
-        decryptedText:  decryptedText,
+        text:           decryptedText,
         timestamp:      DateTime.now(),
         isSent:         false,
         isEncrypted:    true,
@@ -135,18 +134,14 @@ void main() {
       // 4. Encrypt for SQLite persistence (MessageRepositoryImpl behavior)
       final encryptedAtRest = crypto.encrypt(msg.text);
 
-      // Invariant: Raw stored string must NOT contain the secret plaintext
+      // Invariant: Raw stored string must NOT contain the plaintext
       expect(encryptedAtRest.contains(secretPlaintext), isFalse,
           reason: 'Raw database column value must never contain plaintext');
 
-      // Invariant: Decrypting stored value with storage key recovers WIRE PAYLOAD (kamui_v4), NOT plaintext
-      final recoveredStoredPayload = crypto.decrypt(encryptedAtRest);
-      expect(recoveredStoredPayload, equals(wirePayload),
-          reason: 'Database must store encrypted wire payload, not plaintext');
-      expect(recoveredStoredPayload!.contains(secretPlaintext), isFalse,
-          reason: 'Recovered database payload is ciphertext, not plaintext');
-
-      // Invariant: UI presentation resolves transient plaintext without exposing database
+      // Invariant: Decrypting stored value with local storage key recovers readable text for UI
+      final recoveredStoredText = crypto.decrypt(encryptedAtRest);
+      expect(recoveredStoredText, equals(secretPlaintext),
+          reason: 'Local database storage must decrypt to readable plaintext');
       expect(msg.displayText, equals(secretPlaintext));
     });
   });

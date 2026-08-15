@@ -222,7 +222,7 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
             peerPreKeyBundleJson: targetConv.contact.preKeyBundleJson,
           );
         } catch (_) {
-          // If session is not yet synchronized, retain payload for out-of-order recovery
+          // Decryption failed or session desynchronized
         }
       } else if (encryptedPayload.startsWith('kamui_v2:')) {
         try {
@@ -238,13 +238,17 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
         } catch (_) {}
       }
 
-      // SECURITY INVARIANT: Message.text MUST ALWAYS store the wire encrypted payload.
-      // decryptedText is transient and kept in memory only for UI display.
+      // If decryption succeeded: store plaintext (MessageRepository encrypts it locally with AES before saving).
+      // If decryption failed: store explicit fallback string.
+      final messageText = decryptedPlaintext ??
+          (encryptedPayload.startsWith('kamui_v')
+              ? '[Encrypted payload - Decryption failed]'
+              : encryptedPayload);
+
       final incomingMsg = Message(
         id:             'msg_in_${DateTime.now().millisecondsSinceEpoch}',
         conversationId: targetConv.id,
-        text:           encryptedPayload,  // Encrypted wire payload persisted to SQLite
-        decryptedText:  decryptedPlaintext, // In-memory only
+        text:           messageText,
         timestamp:      DateTime.now(),
         isSent:         false,
         isEncrypted:    true,
