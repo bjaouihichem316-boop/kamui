@@ -1,7 +1,6 @@
-<div align="center">
-
 # 🥷 KAMUI (カムイ)
-### Untouchable Serverless Communication over I2P Network
+
+## Untouchable Serverless Communication over I2P Network
 
 [![Flutter](https://img.shields.io/badge/Flutter-3.29-02569B?logo=flutter&logoColor=white)](https://flutter.dev)
 [![Dart](https://img.shields.io/badge/Dart-3.12-0175C2?logo=dart&logoColor=white)](https://dart.dev)
@@ -12,8 +11,6 @@
 *An end-to-end encrypted, serverless, dark-futuristic HUD messaging application operating over Invisible Internet Project (I2P) garlic routing tunnels.*
 
 ---
-
-</div>
 
 ## 🌌 Overview
 
@@ -38,7 +35,7 @@ The application features a dark-futuristic **Cyberpunk HUD aesthetic**, custom p
 
 ## 🏗️ Architecture
 
-```
+```text
                        ┌───────────────────────────────┐
                        │     Kamui Flutter Client      │
                        └───────────────┬───────────────┘
@@ -60,6 +57,7 @@ The application features a dark-futuristic **Cyberpunk HUD aesthetic**, custom p
 ```
 
 ### Local Storage Security
+
 Messages and contacts are persisted using SQLite (`sqflite`). Message bodies are encrypted with **AES-256-GCM ciphertext** before disk insertion.
 
 ---
@@ -107,28 +105,33 @@ This table provides full transparency on what is currently implemented in the co
 ## 🚀 Getting Started
 
 ### Prerequisites
+
 - **Flutter SDK**: `>=3.12.2`
 - **I2P Router Daemon**: `i2pd` or Java I2P router running locally with SAM enabled (`127.0.0.1:7656`).
 
 ### Installation
 
 1. **Clone the repository**:
+
    ```bash
    git clone https://github.com/bjaouihichem316-boop/kamui.git
    cd kamui
    ```
 
 2. **Install dependencies**:
+
    ```bash
    flutter pub get
    ```
 
 3. **Verify project health**:
+
    ```bash
    flutter analyze
    ```
 
 4. **Run application**:
+
    ```bash
    flutter run
    ```
@@ -141,6 +144,4 @@ Distributed under the MIT License. See `LICENSE` for details.
 
 ---
 
-<div align="center">
-  <sub>Built with ❤️ for privacy and decentralization.</sub>
-</div>
+*Built with ❤️ for privacy and decentralization.*

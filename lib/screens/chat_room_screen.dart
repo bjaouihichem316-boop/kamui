@@ -8,6 +8,7 @@ import '../core/providers.dart';
 import '../models/conversation.dart';
 import '../models/message.dart';
 import '../models/contact.dart';
+import '../services/session_manager.dart';
 import '../widgets/chat_bubble.dart';
 import '../widgets/status_dot.dart';
 
@@ -70,6 +71,32 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
     final text = _msgController.text.trim();
     if (text.isEmpty) return;
 
+    // ── Fail-Closed Encryption (Security Requirement) ─────────────────────
+    // encryptMessage() throws SessionUnavailableException if a session cannot
+    // be established. No silent fallback to weaker encryption is permitted.
+    final String encryptedPayload;
+    try {
+      encryptedPayload = await ref.read(sessionManagerProvider).encryptMessage(
+        widget.conversation.id,
+        text,
+        peerIdentityPublicKeyB64: widget.conversation.contact.identityPublicKey,
+      );
+    } on SessionUnavailableException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Send aborted — E2EE session unavailable.\n${e.reason}',
+              style: GoogleFonts.jetBrainsMono(fontSize: 11),
+            ),
+            backgroundColor: vortexOrange,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+      return; // Hard abort — never send without encryption
+    }
+
     final now       = DateTime.now();
     final expiresAt = _ttlSeconds > 0 ? now.add(Duration(seconds: _ttlSeconds)) : null;
 
@@ -87,16 +114,12 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
     _msgController.clear();
     _scrollToBottom();
 
-    // 1. Encrypt text for live network transmission
-    final crypto           = ref.read(cryptoServiceProvider);
-    final encryptedPayload = crypto.encrypt(text);
-
-    // 2. Encrypt + persist to local SQLite DB and update UI state
+    // Persist to local SQLite DB and update UI state
     await ref
         .read(messagesProvider(widget.conversation.id).notifier)
         .addAndPersist(msg);
 
-    // 3. Transmit encrypted payload via live SAM Service
+    // Transmit encrypted payload via live SAM Service
     final sam = ref.read(samServiceProvider);
     await sam.sendRawMessage(widget.conversation.contact.destination, encryptedPayload);
   }

@@ -116,8 +116,23 @@ class SkippedKeyStore {
     return true;
   }
 
+  /// Peeks the key for ([dhPub], [msgN]) without removing it.
+  /// Returns `null` if not present or expired.
+  Uint8List? peek(List<int> dhPub, int msgN) {
+    _pruneExpired();
+    final entry = _store[SkippedKeyIndex(dhPub, msgN)];
+    return entry?.key;
+  }
+
+  /// Removes the key for ([dhPub], [msgN]) from the store.
+  /// Returns `true` if the key was present and removed, `false` otherwise.
+  bool remove(List<int> dhPub, int msgN) {
+    _pruneExpired();
+    return _store.remove(SkippedKeyIndex(dhPub, msgN)) != null;
+  }
+
   /// Retrieves and removes the key for ([dhPub], [msgN]).
-  /// Returns `null` if not present (message is not out-of-order or key expired).
+  /// Retained for convenience / backward compatibility.
   Uint8List? take(List<int> dhPub, int msgN) {
     _pruneExpired();
     final entry = _store.remove(SkippedKeyIndex(dhPub, msgN));
@@ -126,6 +141,9 @@ class SkippedKeyStore {
 
   /// Returns the number of currently stored skipped keys.
   int get length => _store.length;
+
+  /// Clears all stored skipped keys.
+  void clear() => _store.clear();
 
   void _pruneExpired() {
     final cutoff = _nowMs() - kSkippedKeyTtlMs;
@@ -149,11 +167,27 @@ class SkippedKeyStore {
 /// }
 /// ```
 class RatchetHeader {
-  final List<int> dhPub; // sender's current ratchet X25519 public key
+  final List<int> dhPub; // sender's current ratchet X25519 public key (32 bytes)
   final int       n;     // message number in current sending epoch
   final int       pn;    // previous epoch's message count (for skipped key recovery)
 
-  const RatchetHeader({required this.dhPub, required this.n, required this.pn});
+  RatchetHeader({required this.dhPub, required this.n, required this.pn}) {
+    if (dhPub.length != 32) {
+      throw RatchetException(
+        'Invalid DH public key length: ${dhPub.length} (expected 32 bytes).',
+      );
+    }
+    if (n < 0 || n > kMaxSkip) {
+      throw RatchetException(
+        'Invalid message counter n: $n (must be 0 <= n <= $kMaxSkip).',
+      );
+    }
+    if (pn < 0 || pn > kMaxSkip) {
+      throw RatchetException(
+        'Invalid previous counter pn: $pn (must be 0 <= pn <= $kMaxSkip).',
+      );
+    }
+  }
 
   Map<String, dynamic> toJson() => {
     'dh': base64Encode(dhPub),
@@ -161,16 +195,78 @@ class RatchetHeader {
     'pn': pn,
   };
 
-  factory RatchetHeader.fromJson(Map<String, dynamic> json) => RatchetHeader(
-    dhPub: base64Decode(json['dh'] as String),
-    n:     json['n']  as int,
-    pn:    json['pn'] as int,
-  );
+  factory RatchetHeader.fromJson(Map<String, dynamic> json) {
+    final dhVal = json['dh'];
+    final nVal  = json['n'];
+    final pnVal = json['pn'];
+
+    if (dhVal is! String) {
+      throw const RatchetException('Malformed RatchetHeader: missing or invalid "dh" field.');
+    }
+    if (nVal is! int) {
+      throw const RatchetException('Malformed RatchetHeader: missing or invalid "n" field.');
+    }
+    if (pnVal is! int) {
+      throw const RatchetException('Malformed RatchetHeader: missing or invalid "pn" field.');
+    }
+
+    final Uint8List dhBytes;
+    try {
+      dhBytes = base64Decode(dhVal);
+    } catch (e) {
+      throw RatchetException('Malformed RatchetHeader: "dh" is not valid Base64 ($e).');
+    }
+
+    return RatchetHeader(
+      dhPub: dhBytes,
+      n:     nVal,
+      pn:    pnVal,
+    );
+  }
 
   String toBase64() => base64Encode(utf8.encode(jsonEncode(toJson())));
 
-  factory RatchetHeader.fromBase64(String b64) =>
-      RatchetHeader.fromJson(jsonDecode(utf8.decode(base64Decode(b64))) as Map<String, dynamic>);
+  factory RatchetHeader.fromBase64(String b64) {
+    try {
+      final jsonStr = utf8.decode(base64Decode(b64));
+      final dynamic decoded = jsonDecode(jsonStr);
+      if (decoded is! Map<String, dynamic>) {
+        throw const RatchetException('Malformed RatchetHeader: root is not a JSON object.');
+      }
+      return RatchetHeader.fromJson(decoded);
+    } on RatchetException {
+      rethrow;
+    } catch (e) {
+      throw RatchetException('Failed to parse RatchetHeader from Base64: $e');
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Candidate State (Transactional State Mutation)
+// ══════════════════════════════════════════════════════════════════════════════
+
+class _CandidateState {
+  Uint8List rk;
+  Uint8List? cks;
+  Uint8List? ckr;
+  SimpleKeyPair dhS;
+  List<int>? peerRatchetPub;
+  int ns;
+  int nr;
+  int pns;
+  final List<({List<int> dhPub, int msgN, Uint8List key})> stagedSkippedKeys = [];
+
+  _CandidateState({
+    required this.rk,
+    required this.cks,
+    required this.ckr,
+    required this.dhS,
+    required this.peerRatchetPub,
+    required this.ns,
+    required this.nr,
+    required this.pns,
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -325,12 +421,14 @@ class DoubleRatchetSession {
 
   /// Decrypts a `"kamui_v4:..."` wire payload.
   ///
-  /// ## Out-of-order recovery
-  /// 1. If header DH key matches current receiving epoch AND `n < _nr`:
-  ///    the message was delayed — retrieve from [SkippedKeyStore].
-  /// 2. If header DH key is new: perform DH ratchet step, skip remaining keys
-  ///    in old epoch (store them), then derive new receiving chain key.
-  /// 3. Otherwise: advance symmetric ratchet normally.
+  /// ## Transactional State & Out-of-order recovery
+  /// 1. If header DH key matches a key in [SkippedKeyStore]:
+  ///    **Peek ➔ Authenticate ➔ Consume** (key removed ONLY upon MAC verification).
+  /// 2. If header DH key is new: stage DH ratchet step & gap skips in [_CandidateState].
+  /// 3. Otherwise: advance candidate symmetric ratchet.
+  /// 4. Derive MK and attempt AES-256-GCM decryption.
+  /// 5. On MAC success: **commit** candidate state to live state.
+  /// 6. On MAC failure: **rollback** (discard candidate state with zero mutations).
   ///
   /// Returns decrypted [String] or throws [RatchetException].
   Future<String> decrypt(String wirePayload) async {
@@ -353,57 +451,156 @@ class DoubleRatchetSession {
       throw const RatchetException('Malformed kamui_v4 payload — expected 4 segments.');
     }
 
-    final headerB64     = parts[1];
-    final nonceB64      = parts[2];
-    final cipherB64     = parts[3];
+    final headerB64 = parts[1];
+    final nonceB64  = parts[2];
+    final cipherB64 = parts[3];
 
-    final header = RatchetHeader.fromBase64(headerB64);
-    final nonce  = base64Decode(nonceB64);
-    final cipherAndMac = base64Decode(cipherB64);
+    final RatchetHeader header;
+    final Uint8List nonce;
+    final Uint8List cipherAndMac;
 
-    const macLen   = 16;
+    try {
+      header       = RatchetHeader.fromBase64(headerB64);
+      nonce        = Uint8List.fromList(base64Decode(nonceB64));
+      cipherAndMac = Uint8List.fromList(base64Decode(cipherB64));
+    } on RatchetException {
+      rethrow;
+    } catch (e) {
+      throw RatchetException('Malformed payload encoding: $e');
+    }
+
+    const macLen = 16;
+    if (cipherAndMac.length < macLen) {
+      throw const RatchetException('Ciphertext shorter than MAC length (16 bytes).');
+    }
     final cipherText = cipherAndMac.sublist(0, cipherAndMac.length - macLen);
     final macBytes   = cipherAndMac.sublist(cipherAndMac.length - macLen);
 
-    // ── 1. Check skipped-key store (out-of-order) ─────────────────────────
-    final skippedMk = _skipped.take(header.dhPub, header.n);
+    // ── 1. Check skipped-key store (Peek ➔ Authenticate ➔ Consume) ────────
+    final skippedMk = _skipped.peek(header.dhPub, header.n);
     if (skippedMk != null) {
-      return _decryptWithKey(skippedMk, nonce, cipherText, macBytes, headerB64);
+      final plaintext = await _decryptWithKey(
+        skippedMk,
+        nonce,
+        cipherText,
+        macBytes,
+        headerB64,
+      );
+      // MAC authenticated successfully! Now consume from store.
+      _skipped.remove(header.dhPub, header.n);
+      return plaintext;
     }
 
-    // ── 2. DH Ratchet step if peer's ratchet key changed ─────────────────
+    // ── 2. Transactional Ratchet State Machine (Candidate State) ──────────
     final isNewDhEpoch = _peerRatchetPub == null ||
         !_listEqual(header.dhPub, _peerRatchetPub!);
 
+    final candidate = _CandidateState(
+      rk:             Uint8List.fromList(_rk),
+      cks:            _cks != null ? Uint8List.fromList(_cks!) : null,
+      ckr:            _ckr != null ? Uint8List.fromList(_ckr!) : null,
+      dhS:            _dhS,
+      peerRatchetPub: _peerRatchetPub != null ? List<int>.from(_peerRatchetPub!) : null,
+      ns:             _ns,
+      nr:             _nr,
+      pns:            _pns,
+    );
+
+    final Uint8List mk;
+
     if (isNewDhEpoch) {
-      // Skip remaining keys in old receive chain (store for out-of-order recovery)
-      if (_ckr != null) {
-        await _skipMessageKeys(_peerRatchetPub!, header.pn);
+      // Step A: Skip remaining keys in old receive chain up to header.pn
+      if (candidate.ckr != null && candidate.peerRatchetPub != null) {
+        await _skipMessageKeysCandidate(candidate, candidate.peerRatchetPub!, header.pn);
       }
-      // DH Ratchet Step 1: derive new receive chain
-      await _performDhRatchetReceive(header.dhPub);
-      // Skip keys up to header.n in the new receive chain
-      await _skipMessageKeys(header.dhPub, header.n);
+
+      // Step B: Derive new receive chain & new sending chain
+      final remotePub = SimplePublicKey(header.dhPub, type: KeyPairType.x25519);
+
+      // Derive new receive chain from current local key × peer's new key
+      final dhOutR = await _x25519.sharedSecretKey(keyPair: candidate.dhS, remotePublicKey: remotePub);
+      final (rkA, newCkr) = await kdfRk(candidate.rk, await dhOutR.extractBytes());
+
+      // Generate new local sending ratchet keypair & derive new sending chain
+      final newDhS = await _x25519.newKeyPair();
+      final dhOutS = await _x25519.sharedSecretKey(keyPair: newDhS, remotePublicKey: remotePub);
+      final (rkB, newCks) = await kdfRk(rkA, await dhOutS.extractBytes());
+
+      // Update candidate state
+      candidate.pns            = candidate.ns;
+      candidate.ns             = 0;
+      candidate.nr             = 0;
+      candidate.rk             = rkB;
+      candidate.cks            = newCks;
+      candidate.ckr            = newCkr;
+      candidate.dhS            = newDhS;
+      candidate.peerRatchetPub = List<int>.from(header.dhPub);
+
+      // Step C: Skip keys in new receive chain up to header.n
+      await _skipMessageKeysCandidate(candidate, header.dhPub, header.n);
+
+      // Step D: Advance candidate receive chain for current message
+      if (candidate.ckr == null) {
+        throw const RatchetException('No receive chain available after ratchet step.');
+      }
+      final (nextCkr, derivedMk) = await kdfCk(candidate.ckr!);
+      candidate.ckr = nextCkr;
+      candidate.nr++;
+      mk = derivedMk;
     } else {
-      // Same DH epoch — skip keys between _nr and header.n
-      if (header.n < _nr) {
+      // Same DH epoch
+      if (header.n < candidate.nr) {
         throw RatchetException(
-          'Message index ${header.n} already received (current: $_nr). '
+          'Message index ${header.n} already received (current: ${candidate.nr}). '
           'Possible replay attack.',
         );
       }
-      await _skipMessageKeys(header.dhPub, header.n);
+
+      // Skip keys up to header.n
+      await _skipMessageKeysCandidate(candidate, header.dhPub, header.n);
+
+      if (candidate.ckr == null) {
+        throw const RatchetException('No receive chain available in current epoch.');
+      }
+      final (nextCkr, derivedMk) = await kdfCk(candidate.ckr!);
+      candidate.ckr = nextCkr;
+      candidate.nr++;
+      mk = derivedMk;
     }
 
-    // ── 3. Consume the next chain key to get message key ─────────────────
-    if (_ckr == null) {
-      throw const RatchetException('No receive chain available after ratchet step.');
-    }
-    final (nextCkr, mk) = await kdfCk(_ckr!);
-    _ckr = nextCkr;
-    _nr++;
+    // ── 3. Attempt Decryption (MAC verification) ───────────────────────────
+    // If decryption fails, _decryptWithKey throws RatchetException.
+    // The candidate state is completely discarded with ZERO mutation to live state!
+    final plaintext = await _decryptWithKey(
+      mk,
+      nonce,
+      cipherText,
+      macBytes,
+      headerB64,
+    );
 
-    return _decryptWithKey(mk, nonce, cipherText, macBytes, headerB64);
+    // ── 4. COMMIT TRANSACTION (Authentication Succeeded) ──────────────────
+    // Stage all skipped keys into persistent store
+    for (final staged in candidate.stagedSkippedKeys) {
+      final stored = _skipped.put(staged.dhPub, staged.msgN, staged.key);
+      if (!stored) {
+        throw const RatchetException(
+          'Skipped key store full — cannot store skipped message keys.',
+        );
+      }
+    }
+
+    // Atomically commit candidate state to live session state
+    _rk             = candidate.rk;
+    _cks            = candidate.cks;
+    _ckr            = candidate.ckr;
+    _dhS            = candidate.dhS;
+    _peerRatchetPub = candidate.peerRatchetPub;
+    _ns             = candidate.ns;
+    _nr             = candidate.nr;
+    _pns            = candidate.pns;
+
+    return plaintext;
   }
 
   // ── Accessors ─────────────────────────────────────────────────────────────
@@ -419,51 +616,30 @@ class DoubleRatchetSession {
 
   // ── Internal helpers ──────────────────────────────────────────────────────
 
-  /// Performs a DH ratchet receive step, updating _rk and _ckr.
-  /// Then generates a new local sending keypair and updates _rk and _cks.
-  Future<void> _performDhRatchetReceive(List<int> newPeerPub) async {
-    final remotePub = SimplePublicKey(newPeerPub, type: KeyPairType.x25519);
-
-    // Step A: derive new receive chain from current local key × peer's new key
-    final dhOutR = await _x25519.sharedSecretKey(keyPair: _dhS, remotePublicKey: remotePub);
-    final (rkA, newCkr) = await kdfRk(_rk, await dhOutR.extractBytes());
-
-    // Step B: generate new local sending ratchet keypair
-    final newDhS    = await _x25519.newKeyPair();
-    final dhOutS    = await _x25519.sharedSecretKey(keyPair: newDhS, remotePublicKey: remotePub);
-    final (rkB, newCks) = await kdfRk(rkA, await dhOutS.extractBytes());
-
-    // Commit state updates
-    _pns            = _ns;
-    _ns             = 0;
-    _nr             = 0;
-    _rk             = rkB;
-    _cks            = newCks;
-    _ckr            = newCkr;
-    _dhS            = newDhS;
-    _peerRatchetPub = newPeerPub;
-  }
-
-  /// Advances the receive chain from [_nr] up to (but not including) [targetN],
-  /// storing each derived message key in [_skipped].
-  Future<void> _skipMessageKeys(List<int> dhPub, int targetN) async {
-    if (_ckr == null) return;
-    final gap = targetN - _nr;
+  /// Advances candidate receive chain from [candidate.nr] up to [targetN],
+  /// staging derived message keys in [candidate.stagedSkippedKeys].
+  Future<void> _skipMessageKeysCandidate(
+    _CandidateState candidate,
+    List<int>       dhPub,
+    int             targetN,
+  ) async {
+    if (candidate.ckr == null) return;
+    if (targetN < candidate.nr) return;
+    final gap = targetN - candidate.nr;
     if (gap > kMaxSkip) {
       throw RatchetException(
         'Receive gap $gap exceeds maximum skip limit $kMaxSkip — possible DoS.',
       );
     }
-    while (_nr < targetN) {
-      final (nextCkr, mk) = await kdfCk(_ckr!);
-      final stored = _skipped.put(dhPub, _nr, mk);
-      if (!stored) {
-        throw const RatchetException(
-          'Skipped key store full — cannot recover out-of-order message.',
-        );
-      }
-      _ckr = nextCkr;
-      _nr++;
+    while (candidate.nr < targetN) {
+      final (nextCkr, mk) = await kdfCk(candidate.ckr!);
+      candidate.stagedSkippedKeys.add((
+        dhPub: List<int>.from(dhPub),
+        msgN:  candidate.nr,
+        key:   mk,
+      ));
+      candidate.ckr = nextCkr;
+      candidate.nr++;
     }
   }
 

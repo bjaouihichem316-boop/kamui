@@ -1,5 +1,6 @@
 # Kamui Protocol Specification (v2.0.0-draft)
-**Protocol-First Architecture for End-to-End Encrypted Peer-to-Peer Messaging**
+
+Protocol-First Architecture for End-to-End Encrypted Peer-to-Peer Messaging
 
 ---
 
@@ -23,12 +24,15 @@ Kamui v2 relies on modern, misuse-resistant cryptographic primitives:
 | **Key Derivation Function (KDF)** | HKDF-SHA256 (RFC 5869) | State progression & key extraction |
 
 ### 1.1 Long-Term Identity Keys (`IK`)
+
 - Each Kamui node maintains an Ed25519 long-term identity keypair `(IK_priv, IK_pub)`.
 - For Diffie-Hellman operations, `IK_pub` is converted to Curve25519 (`IK_dh_pub`) via birational equivalence:
   $$\text{Curve25519}_u = \frac{1 + \text{Ed25519}_y}{1 - \text{Ed25519}_y}$$
 
 ### 1.2 Prekey Infrastructure
+
 To enable asynchronous messaging (when the recipient is offline), nodes publish a **Prekey Bundle** containing:
+
 - `IK_pub`: Identity public key.
 - `SPK_pub`: Medium-term signed prekey.
 - `SPK_sig`: Signature $\text{Ed25519Sign}(IK\_priv, SPK\_pub)$.
@@ -62,12 +66,14 @@ sequenceDiagram
 ```
 
 ### 2.1 Diffie-Hellman Combinations
+
 1. $DH_1 = \text{X25519}(IK_{A\_dh}, SPK_{B})$ *(Mutual Authentication)*
 2. $DH_2 = \text{X25519}(EK_{A}, IK_{B\_dh})$ *(Initiator Forward Secrecy)*
 3. $DH_3 = \text{X25519}(EK_{A}, SPK_{B})$ *(Responder Forward Secrecy)*
 4. $DH_4 = \text{X25519}(EK_{A}, OPK_{B})$ *(One-Time Prekey Forward Secrecy, omitted if pool exhausted)*
 
 ### 2.2 Shared Key Derivation
+
 $$\text{SK} = \text{HKDF-Extract}(\text{Salt}=0^{32}, \text{Info}=\text{"Kamui-v2-X3DH"}, DH_1 \parallel DH_2 \parallel DH_3 \parallel DH_4)$$
 
 ---
@@ -92,12 +98,15 @@ graph TD
 ```
 
 ### 3.1 KDF Chain Progression
+
 The state consists of:
+
 - **Root Key (`RK`)**: Updated during DH ratchet steps.
 - **Sending Chain Key (`CK_s`)**: Advanced for each sent message.
 - **Receiving Chain Key (`CK_r`)**: Advanced for each received message.
 
-#### Symmetric-Key Ratchet (Per Message):
+#### Symmetric-Key Ratchet (Per Message)
+
 $$\begin{aligned}
 MK_{i} &= \text{HKDF-Expand}(CK_i, \text{"Kamui-MsgKey"}, 32) \\
 CK_{i+1} &= \text{HKDF-Expand}(CK_i, \text{"Kamui-NextChain"}, 32)
