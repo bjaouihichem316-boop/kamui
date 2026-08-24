@@ -43,6 +43,7 @@ class KamuiConstants {
   static const Duration scanLineDuration       = Duration(milliseconds: 4000);
 
   // ─── Mock / Dev ───────────────────────────────────────────────
-  /// Set to true to use mock data instead of real SAM bridge.
+  /// Master switch for mock seed data. Only honored in debug builds
+  /// (`kDebugMode`); release/profile builds never seed mock data.
   static const bool useMockData = true;
 }

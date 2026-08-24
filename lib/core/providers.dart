@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -17,10 +18,17 @@ import '../services/notification_service.dart';
 import '../services/sam_service.dart';
 import '../services/session_manager.dart';
 import '../services/x3dh_service.dart';
+import 'constants.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INFRASTRUCTURE PROVIDERS
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Mock seed data gate: seeding is allowed only in debug builds when
+/// [KamuiConstants.useMockData] is enabled. Release/profile builds always
+/// receive empty data so shipped binaries contain no fake identities,
+/// conversations, or messages.
+bool get _mockSeedingEnabled => KamuiConstants.useMockData && kDebugMode;
 
 /// Singleton [CryptoService]. Must be initialized in main() before use.
 final cryptoServiceProvider = Provider<CryptoService>((ref) {
@@ -89,10 +97,27 @@ class PersonaNotifier extends Notifier<Persona> {
     ),
   ];
 
-  @override
-  Persona build() => _mockPersonas.first;
+  /// Personas served to the UI. Empty outside debug seeding mode.
+  static List<Persona> get _activePersonas =>
+      _mockSeedingEnabled ? _mockPersonas : const <Persona>[];
 
-  List<Persona> get availablePersonas => _mockPersonas;
+  /// Neutral placeholder used when no seeded personas exist (release/profile).
+  static const _unconfiguredPersona = Persona(
+    id:             'local',
+    name:           'Local Identity',
+    destinationKey: '',
+    avatarInitial:  'K',
+    tag:            'Unconfigured',
+  );
+
+  @override
+  Persona build() {
+    final personas = _activePersonas;
+    if (personas.isEmpty) return _unconfiguredPersona;
+    return personas.first;
+  }
+
+  List<Persona> get availablePersonas => _activePersonas;
 
   Future<void> selectPersona(Persona persona) async {
     state = persona;
@@ -280,6 +305,7 @@ class ConversationsNotifier extends AsyncNotifier<List<Conversation>> {
       final saved = await repo.getAll();
       if (saved.isNotEmpty) return saved;
     } catch (_) {}
+    if (!_mockSeedingEnabled) return const [];
     return _buildMockConversations();
   }
 
@@ -425,6 +451,7 @@ class MessagesNotifier extends FamilyAsyncNotifier<List<Message>, String> {
       final saved = await repo.getByConversation(conversationId);
       if (saved.isNotEmpty) return saved;
     } catch (_) {}
+    if (!_mockSeedingEnabled) return const [];
     return _mockMessages[conversationId] ?? [];
   }
 

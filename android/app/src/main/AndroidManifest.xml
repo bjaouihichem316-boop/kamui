@@ -1,6 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required for I2P SAM v3 TCP connections to the local i2pd router (127.0.0.1:7656). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
-        android:label="kamui"
+        android:label="Kamui"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

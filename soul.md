@@ -12,8 +12,8 @@ Kamui is an untouchable, serverless communication layer built on top of the I2P 
 
 ## 3. Tech Stack & Architecture
 - UI / Frontend: Flutter (Dart) with Dark OLED Theme (#000000).
-- Core Engine: Embedded i2pd (C++) via Dart FFI.
-- Local Storage: SQLCipher (AES-256 encrypted SQLite).
+- Core Engine: I2P SAM v3.3 client (requires external i2pd router at 127.0.0.1:7656).
+- Local Storage: SQLite with AES-256-GCM field-level encryption for message bodies.
 
 ## 4. Brand ID
 - Accent Color: Vortex Orange (#FF4500).

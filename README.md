@@ -75,12 +75,12 @@ This table provides full transparency on what is currently implemented in the co
 | **Prekey Bundle Infrastructure & QR Handshake** | ✅ Implemented (Live) | `lib/services/identity_key_service.dart` & `lib/widgets/qr_share_dialog.dart` — v3 PreKeyBundle payload |
 | **Out-of-Order Skipped Keys Caching (Anti-DoS)** | ✅ Implemented (Live) | `lib/services/double_ratchet.dart` — Peek ➔ Authenticate ➔ Consume pattern with TTL & max skip bounds |
 | **Fail-Closed E2EE Encryption (no silent downgrade)** | ✅ Implemented (Live) | `SessionManager.encryptV4()` & `chat_room_screen.dart` — Throws `SessionUnavailableException` on failure |
-| **Live v4 Wire Transport & Decryption** | ✅ Implemented (Live) | `kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>` with live stream decryption in `providers.dart` |
+| **Live v4 Wire Transport & Decryption** | ✅ Implemented (Live) | **Outbound-only** — `kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>` with live stream decryption in `providers.dart`. Inbound v4 transport still in progress. |
 | **I2P SAM v3.3 STREAM Transport** | ✅ Implemented | `lib/services/sam_service.dart` — TCP socket to `127.0.0.1:7656` |
 | **OS Notification Metadata Isolation** | ✅ Implemented | `lib/services/notification_service.dart` — generic title/body only |
 | **Self-Destruct TTL Messages** | ✅ Implemented | `lib/models/message.dart` — configurable expiry + DB purge |
 | **Duress PIN → Defense-in-depth local storage & key wipe** | ✅ Implemented | DB + secure storage wipe on duress PIN entry |
-| **Biometric / PIN Lock Gate** | ✅ Implemented | Platform local auth on app resume |
+| **Biometric / PIN Lock Gate** | ✅ Implemented | Platform local auth on app resume — **not yet enforced at startup** |
 
 > **Legend**: ✅ Implemented = verifiable in current `main` branch source code. All v4 (X3DH + Double Ratchet) components are active and live.
 
