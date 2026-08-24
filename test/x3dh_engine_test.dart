@@ -46,10 +46,12 @@ void main() {
     final spkSig = await ed25519.sign(spkPub.bytes, keyPair: ikEdKP);
     // OPK
     List<int>? opkPubBytes;
+    int? opkId;
     if (includeOpk) {
       final opkKP  = await x25519.newKeyPair();
       final opkPub = await opkKP.extractPublicKey();
       opkPubBytes  = opkPub.bytes;
+      opkId        = 1;
     }
 
     final bundle = PreKeyBundle(
@@ -57,6 +59,7 @@ void main() {
       ikPubDh: ikDhPub.bytes,
       spkPub:  spkPub.bytes,
       spkSig:  spkSig.bytes,
+      opkId:   opkId,
       opkPub:  opkPubBytes,
     );
 
@@ -161,6 +164,7 @@ void main() {
         ikPubDh: bob.bundle.ikPubDh,
         spkPub:  bob.bundle.spkPub,
         spkSig:  bob.bundle.spkSig,
+        opkId:   1,
         opkPub:  opkPub.bytes,
       );
 
@@ -203,6 +207,7 @@ void main() {
         ikPubDh: bob.bundle.ikPubDh,
         spkPub:  bob.bundle.spkPub,
         spkSig:  bob.bundle.spkSig,
+        opkId:   1,
         opkPub:  opkPub.bytes,
       );
       final sk4 = await X3dhService.initiatorHandshake(

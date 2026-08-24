@@ -105,8 +105,9 @@ class SessionManager {
   // Active v2 legacy sessions (backward compat only)
   final Map<String, SessionState> _v2Sessions = {};
 
-  final _x25519 = X25519();
-  final _aesGcm = AesGcm.with256bits();
+  final _ed25519 = Ed25519();
+  final _x25519  = X25519();
+  final _aesGcm  = AesGcm.with256bits();
 
   // ── Session establishment ─────────────────────────────────────────────────
 
@@ -209,7 +210,7 @@ class SessionManager {
   ///
   /// If no session exists for [conversationId], performs X3DH handshake as Alice,
   /// initializes the ratchet session, encrypts the first message, and wraps
-  /// the result in a [HandshakeInitEnvelope] JSON string.
+  /// the result in a [HandshakeInitEnvelope] JSON string with Ed25519 identity binding.
   ///
   /// If a session is already active, returns `"kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>"`.
   ///
@@ -242,7 +243,9 @@ class SessionManager {
     }
 
     final ikADh = identityService.ikDhKeyPair;
+    final ikAEd = identityService.ikEdKeyPair;
     if (ikADh == null ||
+        ikAEd == null ||
         identityService.identityEdPublicKeyB64 == null ||
         identityService.identityDhPublicKeyB64 == null) {
       throw const SessionUnavailableException(
@@ -273,10 +276,17 @@ class SessionManager {
       // Encrypt the first message with the new ratchet session
       final firstMessage = await session.encrypt(plaintext);
 
+      // Cryptographically bind IK_ed and IK_dh with Ed25519 signature
+      final ikEdBytes  = base64Decode(identityService.identityEdPublicKeyB64!);
+      final ikDhBytes  = base64Decode(identityService.identityDhPublicKeyB64!);
+      final transcript = X3dhService.computeIdentityBindingTranscript(ikEdBytes, ikDhBytes);
+      final sig        = await _ed25519.sign(transcript, keyPair: ikAEd);
+
       // Wrap in HandshakeInitEnvelope
       final envelope = HandshakeInitEnvelope(
-        ikEd:         base64Decode(identityService.identityEdPublicKeyB64!),
-        ikDh:         base64Decode(identityService.identityDhPublicKeyB64!),
+        ikEd:         ikEdBytes,
+        ikDh:         ikDhBytes,
+        ikSig:        sig.bytes,
         ek:           x3dhResult.ekPub,
         opkIdUsed:    x3dhResult.opkId,
         firstMessage: firstMessage,
@@ -311,6 +321,18 @@ class SessionManager {
         final decodedMap = jsonDecode(wirePayload.trim()) as Map<String, dynamic>;
         final envelope   = HandshakeInitEnvelope.fromJson(decodedMap);
 
+        // Verify Alice's Identity Key binding: IK_ed must authenticate IK_dh
+        final isValidBinding = await X3dhService.verifyIdentityBinding(
+          ikEd:  envelope.ikEd,
+          ikDh:  envelope.ikDh,
+          ikSig: envelope.ikSig,
+        );
+        if (!isValidBinding) {
+          throw const SessionUnavailableException(
+            'Identity binding verification failed: IK_ed does not cryptographically authenticate IK_dh.',
+          );
+        }
+
         final ikBDh = identityService.ikDhKeyPair;
         final spkB  = identityService.spkKeyPair;
         if (ikBDh == null || spkB == null) {
@@ -338,23 +360,24 @@ class SessionManager {
           ikADhPub: envelope.ikDh,
         );
 
-        // Consume OPK immediately upon successful cryptographic derivation
-        if (envelope.opkIdUsed != null) {
-          await identityService.consumeOpk(envelope.opkIdUsed!);
-        }
-
-        // Initialize Double Ratchet session as Bob (receiver)
-        final bobSession = await DoubleRatchetSession.initBob(
+        // Initialize candidate Double Ratchet session as Bob (receiver)
+        final candidateBobSession = await DoubleRatchetSession.initBob(
           conversationId:           conversationId,
           peerIdentityPublicKeyB64: base64Encode(envelope.ikDh),
           sk:                       sharedSecret,
           spkBDh:                   spkB,
         );
 
-        _v4Sessions[conversationId] = bobSession;
+        // Decrypt first_message on candidate session — validates AEAD MAC
+        final plaintext = await candidateBobSession.decrypt(envelope.firstMessage);
 
-        // Decrypt the first message embedded in the envelope
-        return await bobSession.decrypt(envelope.firstMessage);
+        // Transactional commit: Consume OPK and commit session ONLY after successful AEAD auth
+        if (envelope.opkIdUsed != null) {
+          await identityService.consumeOpk(envelope.opkIdUsed!);
+        }
+        _v4Sessions[conversationId] = candidateBobSession;
+
+        return plaintext;
       } on SessionUnavailableException {
         rethrow;
       } on X3dhException catch (e) {

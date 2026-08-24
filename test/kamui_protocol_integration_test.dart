@@ -36,6 +36,7 @@ void main() {
       ikPubDh: ikDhPub.bytes,
       spkPub:  spkPub.bytes,
       spkSig:  spkSig.bytes,
+      opkId:   1,
       opkPub:  opkPub.bytes,
     );
 

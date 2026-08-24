@@ -76,6 +76,42 @@ sequenceDiagram
 
 $$\text{SK} = \text{HKDF-Extract}(\text{Salt}=0^{32}, \text{Info}=\text{"Kamui-v2-X3DH"}, DH_1 \parallel DH_2 \parallel DH_3 \parallel DH_4)$$
 
+### 2.3 Identity Binding (`ik_sig`, Mandatory)
+
+The `HandshakeInitEnvelope` carries a **mandatory** `ik_sig` field: an Ed25519 signature produced by Alice's long-term identity *signing* key over a domain-separated transcript binding her two identity public keys together:
+
+$$\text{ik\_sig} = \text{Ed25519Sign}\big(IK_{A\_ed\_priv},\ \underbrace{\text{"Kamui-X3DH-Identity-Binding-v1"}}_{\text{domain}} \parallel IK_{A\_ed} \parallel IK_{A\_dh}\big)$$
+
+- **Domain separation**: `'Kamui-X3DH-Identity-Binding-v1'`.
+- **Transcript**: domain string ‖ raw 32-byte `IK_ed` ‖ raw 32-byte `IK_dh`.
+- **Verification (responder side)**: performed via `X3dhService.verifyIdentityBinding()` **before any session state is created or any OPK is touched**. Failure ⇒ handshake rejected immediately (**fail-closed**).
+- **Security rationale**: closes the *key-substitution gap*. Without the binding, `IK_ed` (used for SPK signature verification and peer identity) and `IK_dh` (used in $DH_1$/$DH_2$) are only loosely associated; an attacker could substitute a DH identity key under their control while presenting a victim's Ed25519 identity. The signature makes `IK_ed` cryptographically authenticate `IK_dh`.
+
+### 2.4 Transactional OPK Consumption (Responder)
+
+The responder consumes one-time prekeys **transactionally**, never speculatively:
+
+1. On receipt of a `HandshakeInitEnvelope`, Bob derives $\text{SK}$, initializes a **candidate** Double Ratchet session, and attempts to decrypt `first_message` on that candidate only.
+2. **Commit** (OPK marked consumed + candidate promoted to the active session) happens **only after** AEAD authentication of `first_message` succeeds.
+3. On any decryption failure: **no** OPK consumption, **no** session commit. Forged or garbage handshakes therefore cannot exhaust Bob's OPK pool — closing the *OPK-exhaustion DoS* vector on the live inbound surface.
+
+### 2.5 Four-State OPK Validation (Initiator)
+
+Before any DH computation, the initiator validates bundle OPK consistency across **four explicit states** (fail-closed):
+
+| State | `opkId` | `opkPub` | Verdict |
+| :---: | :---: | :---: | :--- |
+| 1 | absent | absent | ✅ Valid — proceed with 3-DH |
+| 2 | present | present | ✅ Valid — proceed with 4-DH ($DH_4$) |
+| 3 | absent | present | ❌ Reject — malformed bundle (`X3dhException`) |
+| 4 | present | absent | ❌ Reject — malformed bundle (`X3dhException`) |
+
+This removes ambiguity (and the former implicit `opkId ?? 1` fallback): an OPK contributes to $\text{SK}$ **only** when both its identifier and public key are present and mutually consistent.
+
+### 2.6 Wire Format & Mixed-Version Behavior
+
+On the wire, `ik_sig` is a required base64 field (64 bytes) in the `HandshakeInitEnvelope` JSON, alongside `ik_ed`, `ik_dh`, `ek`, optional `opk_id_used`, and `first_message`. Peers running versions **without** `ik_sig` support fail handshakes closed against `ik_sig`-enforcing peers (envelope missing/invalid `ik_sig` ⇒ rejection). This mixed-version incompatibility is intentional and points in the **safe direction**: version skew degrades to *"no communication"*, never to *"unauthenticated communication"*.
+
 ---
 
 ## 3. Ratchet Engine (Double Ratchet System)
@@ -242,6 +278,7 @@ On unexpected control-socket loss (error or remote close) while a session was li
 | **Static Code Integrity** | `flutter analyze` | ✅ Implemented | `No issues found!` |
 | **Fail-Closed Encryption** | `SessionManager.encryptV4()` & `encryptMessage()` | ✅ Implemented (Live) | Throws `SessionUnavailableException`; no silent downgrade |
 | **Full X3DH Key Agreement** | `X3dhService` & `SessionManager` | ✅ Implemented (Live) | Authenticated 3-DH / 4-DH with Ed25519 SPK verification |
+| **Identity Binding & Transactional OPK Consumption** | `X3dhService.verifyIdentityBinding` & `SessionManager` responder path | ✅ Implemented (Live) | Mandatory fail-closed `ik_sig` (domain `'Kamui-X3DH-Identity-Binding-v1'`); OPK consumed only after candidate-session AEAD validation; four-state OPK validation; `test/security_findings_v4_test.dart` |
 | **Double Ratchet Engine** | `DoubleRatchetSession` & `SessionManager` | ✅ Implemented (Live) | DH ratchet + symmetric KDF + candidate state rollback |
 | **Skipped Key Store (Anti-DoS)** | `SkippedKeyStore` | ✅ Implemented (Live) | Peek ➔ Authenticate ➔ Consume pattern with max skip bound |
 | **Prekey Bundle QR Handshake** | `IdentityKeyService` & `QrShareDialog` | ✅ Implemented (Live) | Embeds full v3 PreKeyBundle in QR payload |

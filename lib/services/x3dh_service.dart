@@ -88,9 +88,10 @@ class X3dhResult {
 /// Envelope transmitted on the wire for the initial message of a v4 conversation.
 ///
 /// Contains Alice's public parameters (Ed25519 identity key, X25519 DH identity key,
-/// ephemeral public key, and consumed OPK identifier) along with the first
-/// Double-Ratchet-encrypted payload. This gives Bob all information required
-/// to compute the X3DH shared secret and initialize his receiver ratchet state.
+/// Ed25519 identity-binding signature over IK_ed ‖ IK_dh, ephemeral public key,
+/// and consumed OPK identifier) along with the first Double-Ratchet-encrypted payload.
+/// This gives Bob all information required to cryptographically verify Alice's identity,
+/// compute the X3DH shared secret, and initialize his receiver ratchet state.
 class HandshakeInitEnvelope {
   static const String envelopeType = 'kamui_v4_handshake_init';
 
@@ -99,6 +100,10 @@ class HandshakeInitEnvelope {
 
   /// Alice's X25519 DH identity public key (32 bytes).
   final List<int> ikDh;
+
+  /// Alice's cryptographic identity-binding signature (64 bytes):
+  /// Ed25519.sign(IK_ed_priv, "Kamui-X3DH-Identity-Binding-v1" ‖ IK_ed_pub ‖ IK_dh_pub)
+  final List<int> ikSig;
 
   /// Alice's ephemeral X25519 public key (32 bytes).
   final List<int> ek;
@@ -112,6 +117,7 @@ class HandshakeInitEnvelope {
   const HandshakeInitEnvelope({
     required this.ikEd,
     required this.ikDh,
+    required this.ikSig,
     required this.ek,
     this.opkIdUsed,
     required this.firstMessage,
@@ -121,6 +127,7 @@ class HandshakeInitEnvelope {
     'type': envelopeType,
     'ik_ed': base64Encode(ikEd),
     'ik_dh': base64Encode(ikDh),
+    'ik_sig': base64Encode(ikSig),
     'ek': base64Encode(ek),
     if (opkIdUsed != null) 'opk_id_used': opkIdUsed,
     'first_message': firstMessage,
@@ -133,6 +140,7 @@ class HandshakeInitEnvelope {
     return HandshakeInitEnvelope(
       ikEd: base64Decode(json['ik_ed'] as String),
       ikDh: base64Decode(json['ik_dh'] as String),
+      ikSig: base64Decode(json['ik_sig'] as String),
       ek: base64Decode(json['ek'] as String),
       opkIdUsed: json['opk_id_used'] as int?,
       firstMessage: json['first_message'] as String,
@@ -171,10 +179,40 @@ class HandshakeInitEnvelope {
 /// ```
 class X3dhService {
   static const _hkdfInfo = 'Kamui-X3DH-v3';
+  static const _identityBindingDomain = 'Kamui-X3DH-Identity-Binding-v1';
   static final _ed25519  = Ed25519();
   static final _x25519   = X25519();
 
   // ── Public API ─────────────────────────────────────────────────────────────
+
+  /// Computes the canonical domain-separated transcript for identity binding.
+  static List<int> computeIdentityBindingTranscript(List<int> ikEd, List<int> ikDh) {
+    return [
+      ...utf8.encode(_identityBindingDomain),
+      ...ikEd,
+      ...ikDh,
+    ];
+  }
+
+  /// Verifies that [ikSig] is a valid Ed25519 signature over
+  /// `("Kamui-X3DH-Identity-Binding-v1" ‖ ikEd ‖ ikDh)` produced by [ikEd].
+  static Future<bool> verifyIdentityBinding({
+    required List<int> ikEd,
+    required List<int> ikDh,
+    required List<int> ikSig,
+  }) async {
+    try {
+      if (ikEd.length != 32 || ikDh.length != 32 || ikSig.length != 64) {
+        return false;
+      }
+      final ikPub = SimplePublicKey(ikEd, type: KeyPairType.ed25519);
+      final sig   = Signature(ikSig, publicKey: ikPub);
+      final transcript = computeIdentityBindingTranscript(ikEd, ikDh);
+      return await _ed25519.verify(transcript, signature: sig);
+    } catch (_) {
+      return false;
+    }
+  }
 
   /// Verifies the SPK signature embedded in [bundle].
   ///
@@ -193,9 +231,10 @@ class X3dhService {
   /// **Alice (Initiator)** performs the X3DH handshake against Bob's [bundleB].
   ///
   /// 1. Verify [bundleB].spkSig — throws [X3dhException] on failure (Fail-Closed).
-  /// 2. Generate ephemeral key EK_A.
-  /// 3. Compute DH1–DH3 (+ optional DH4 if OPK present).
-  /// 4. Derive 32-byte SK via HKDF-SHA256.
+  /// 2. Validate OPK consistency (Four explicit states).
+  /// 3. Generate ephemeral key EK_A.
+  /// 4. Compute DH1–DH3 (+ optional DH4 if OPK present).
+  /// 5. Derive 32-byte SK via HKDF-SHA256.
   static Future<X3dhResult> initiatorHandshake({
     required SimpleKeyPair ikADh,    // Alice's X25519 DH identity key
     required PreKeyBundle  bundleB,  // Bob's PreKeyBundle
@@ -207,15 +246,27 @@ class X3dhService {
       );
     }
 
-    // 2. Generate fresh ephemeral key EK_A
+    // 2. Validate OPK consistency (Four explicit states — Fail-Closed)
+    if (bundleB.opkPub != null && bundleB.opkId == null) {
+      throw const X3dhException(
+        'Malformed PreKeyBundle: opkPub present without explicit opkId',
+      );
+    }
+    if (bundleB.opkPub == null && bundleB.opkId != null) {
+      throw const X3dhException(
+        'Malformed PreKeyBundle: opkId present without opkPub',
+      );
+    }
+
+    // 3. Generate fresh ephemeral key EK_A
     final ekA    = await _x25519.newKeyPair();
     final ekAPub = await ekA.extractPublicKey();
 
-    // 3. Reconstruct Bob's DH public keys
+    // 4. Reconstruct Bob's DH public keys
     final ikBDhPub = SimplePublicKey(bundleB.ikPubDh, type: KeyPairType.x25519);
     final spkBPub  = SimplePublicKey(bundleB.spkPub,  type: KeyPairType.x25519);
 
-    // 4. DH operations
+    // 5. DH operations
     // DH1 = X25519(IK_A_dh_priv, SPK_B_pub) — mutual authentication
     final dh1 = await _dh(ikADh, spkBPub);
     // DH2 = X25519(EK_A_priv, IK_B_dh_pub) — initiator forward secrecy
@@ -226,13 +277,13 @@ class X3dhService {
     // DH4 = X25519(EK_A_priv, OPK_B_pub) — one-time FS [optional]
     List<int>? dh4;
     int? usedOpkId;
-    if (bundleB.opkPub != null) {
+    if (bundleB.opkPub != null && bundleB.opkId != null) {
       final opkBPub = SimplePublicKey(bundleB.opkPub!, type: KeyPairType.x25519);
       dh4 = await _dh(ekA, opkBPub);
-      usedOpkId = bundleB.opkId ?? 1;
+      usedOpkId = bundleB.opkId;
     }
 
-    // 5. Derive shared secret
+    // 6. Derive shared secret
     final sk = await _hkdf([...dh1, ...dh2, ...dh3, ...?dh4]);
 
     return X3dhResult(

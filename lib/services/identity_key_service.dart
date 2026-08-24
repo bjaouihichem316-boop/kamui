@@ -78,6 +78,9 @@ class IdentityKeyService {
   /// X25519 identity DH public key (base64) — used in X3DH DH1/DH2.
   String? get identityDhPublicKeyB64 => _ikDhPubB64;
 
+  /// Ed25519 identity key pair — signing surface.
+  SimpleKeyPair? get ikEdKeyPair => _ikEdKeyPair;
+
   /// X25519 identity DH key pair — required by [SessionManager] for X3DH.
   SimpleKeyPair? get ikDhKeyPair => _ikDhKeyPair;
 
@@ -439,11 +442,19 @@ class IdentityKeyService {
     ]) {
       await _secureStorage.delete(key: alias);
     }
-    resetForTesting();
+    _resetInMemoryState();
   }
 
   /// Resets all in-memory keys and pool state (for test isolation).
   void resetForTesting() {
+    _resetInMemoryState();
+  }
+
+  /// Clears all in-memory key material and OPK pool state.
+  ///
+  /// Shared by [clearKeys] (after secure-storage wipe) and
+  /// [resetForTesting] (test isolation). No persistent state is touched.
+  void _resetInMemoryState() {
     _ikEdKeyPair  = null;
     _ikDhKeyPair  = null;
     _spkKeyPair   = null;
