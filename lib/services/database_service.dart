@@ -2,7 +2,10 @@ import 'dart:async';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
+
+import '../core/constants.dart';
 import 'identity_key_service.dart';
 import 'notification_service.dart';
 import 'session_manager.dart';
@@ -172,6 +175,12 @@ class DatabaseService {
       if (await tempDir.exists()) {
         await tempDir.delete(recursive: true);
       }
+    } catch (_) {}
+
+    // 6. Clear persisted UI preferences — no theme residue may survive a wipe.
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(KamuiConstants.themePrefsKey);
     } catch (_) {}
   }
 

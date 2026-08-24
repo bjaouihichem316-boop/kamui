@@ -5,10 +5,12 @@ import 'package:google_fonts/google_fonts.dart';
 import '../core/constants.dart';
 import '../core/providers.dart';
 import '../core/theme.dart';
+import '../services/lock_service.dart';
 import '../widgets/hud_background.dart';
 import '../widgets/kamui_button.dart';
 import '../widgets/vortex_ring.dart';
 import 'chat_list_screen.dart';
+import 'lock_screen.dart';
 
 class SplashScreen extends ConsumerStatefulWidget {
   const SplashScreen({super.key});
@@ -96,11 +98,16 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
     super.dispose();
   }
 
-  void _enterTheVoid() {
+  /// Routes through the lock gate: when the shield is armed, the user must
+  /// authenticate before reaching any chat surface.
+  Future<void> _enterTheVoid() async {
+    final lockEnabled = await LockService().isLockEnabled();
+    if (!mounted) return;
     Navigator.pushReplacement(
       context,
       PageRouteBuilder(
-        pageBuilder: (context, anim, secondaryAnim) => const ChatListScreen(),
+        pageBuilder: (context, anim, secondaryAnim) =>
+            lockEnabled ? const LockScreen() : const ChatListScreen(),
         transitionDuration: const Duration(milliseconds: 600),
         transitionsBuilder: (context, anim, secondaryAnim, child) =>
             FadeTransition(

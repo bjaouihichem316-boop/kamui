@@ -79,4 +79,14 @@ class KamuiConstants {
   /// Master switch for mock seed data. Only honored in debug builds
   /// (`kDebugMode`); release/profile builds never seed mock data.
   static const bool useMockData = true;
+
+  /// Debug-only universal unlock PIN for the lock screen so developers are
+  /// never locked out during development. Call sites MUST guard with
+  /// `kDebugMode` — this is tree-shaken out of release builds.
+  static const String devUnlockPin = '000000';
+
+  /// SharedPreferences key persisting the selected neon theme index.
+  /// Referenced by [DatabaseService.nuke] so a duress wipe leaves no
+  /// preference residue.
+  static const String themePrefsKey = 'kamui_neon_theme_index';
 }

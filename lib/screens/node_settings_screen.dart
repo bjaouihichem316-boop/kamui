@@ -11,6 +11,7 @@ import '../services/lock_service.dart';
 import '../services/sam_service.dart';
 import '../widgets/hud_background.dart';
 import '../widgets/kamui_button.dart';
+import '../widgets/pin_keypad.dart';
 import '../widgets/qr_share_dialog.dart';
 import '../widgets/status_dot.dart';
 import 'lock_screen.dart';
@@ -694,23 +695,7 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
             children: [
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () async {
-                    await LockService().setupSecurity(
-                      normalPin: '1337',
-                      duressPin: '9999',
-                    );
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          backgroundColor: panelDark,
-                          content: Text(
-                            'Shield Activated: Primary PIN [1337] • Duress PIN [9999]',
-                            style: GoogleFonts.jetBrainsMono(color: emeraldGlow, fontSize: 11),
-                          ),
-                        ),
-                      );
-                    }
-                  },
+                  onPressed: _showShieldSetupSheet,
                   icon:  Icon(Icons.lock_outline, size: 14, color: emeraldGlow),
                   label: Text('ENABLE SHIELD',
                       style: GoogleFonts.rajdhani(
@@ -745,6 +730,28 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
         ],
       ),
     );
+  }
+
+  /// Opens the guided PIN setup flow. Returns `true` via the sheet when the
+  /// shield was armed; success feedback never echoes PIN values.
+  Future<void> _showShieldSetupSheet() async {
+    final armed = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => const _ShieldSetupSheet(),
+    );
+    if (armed == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: panelDark,
+          content: Text(
+            'SHIELD ACTIVATED • Access PINs stored as salted hashes',
+            style: GoogleFonts.jetBrainsMono(color: emeraldGlow, fontSize: 11),
+          ),
+        ),
+      );
+    }
   }
 
   Widget _buildThemeSwitcherCard(NeonTheme currentTheme) {
@@ -869,4 +876,251 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
       ),
     );
   }
+}
+
+/// Guided, user-chosen PIN setup flow: primary → confirm → optional duress
+/// → confirm. PINs are captured via the shared [PinKeypad] and are never
+/// echoed back in any status text or SnackBar.
+enum _ShieldStep { enterPrimary, confirmPrimary, enterDuress, confirmDuress }
+
+class _ShieldSetupSheet extends StatefulWidget {
+  const _ShieldSetupSheet();
+
+  @override
+  State<_ShieldSetupSheet> createState() => _ShieldSetupSheetState();
+}
+
+class _ShieldSetupSheetState extends State<_ShieldSetupSheet> {
+  static const int _minDigits = 4;
+  static const int _maxDigits = 6;
+
+  _ShieldStep _step    = _ShieldStep.enterPrimary;
+  String      _entered = '';
+  String      _primary = '';
+  String      _duress  = '';
+  String?     _error;
+  bool        _saving  = false;
+
+  String get _statusText {
+    switch (_step) {
+      case _ShieldStep.enterPrimary:
+        return 'SET ACCESS PIN ($_minDigits–$_maxDigits DIGITS)';
+      case _ShieldStep.confirmPrimary:
+        return 'CONFIRM ACCESS PIN';
+      case _ShieldStep.enterDuress:
+        return 'SET DURESS PIN (OPTIONAL)';
+      case _ShieldStep.confirmDuress:
+        return 'CONFIRM DURESS PIN';
+    }
+  }
+
+  void _onDigit(String digit) {
+    if (_saving || _entered.length >= _maxDigits) return;
+    setState(() {
+      _entered += digit;
+      _error = null;
+    });
+  }
+
+  void _onBackspace() {
+    if (_saving || _entered.isEmpty) return;
+    setState(() {
+      _entered = _entered.substring(0, _entered.length - 1);
+      _error = null;
+    });
+  }
+
+  Future<void> _confirmSegment() async {
+    if (_saving || _entered.length < _minDigits) return;
+    switch (_step) {
+      case _ShieldStep.enterPrimary:
+        setState(() {
+          _primary = _entered;
+          _entered = '';
+          _step = _ShieldStep.confirmPrimary;
+        });
+      case _ShieldStep.confirmPrimary:
+        if (_entered != _primary) {
+          setState(() {
+            _error = 'MISMATCH — RE-ENTER ACCESS PIN';
+            _entered = '';
+          });
+          return;
+        }
+        setState(() {
+          _entered = '';
+          _step = _ShieldStep.enterDuress;
+        });
+      case _ShieldStep.enterDuress:
+        if (_entered == _primary) {
+          setState(() {
+            _error = 'DURESS PIN MUST DIFFER FROM ACCESS PIN';
+            _entered = '';
+          });
+          return;
+        }
+        setState(() {
+          _duress = _entered;
+          _entered = '';
+          _step = _ShieldStep.confirmDuress;
+        });
+      case _ShieldStep.confirmDuress:
+        if (_entered != _duress) {
+          setState(() {
+            _error = 'MISMATCH — RE-ENTER DURESS PIN';
+            _entered = '';
+          });
+          return;
+        }
+        await _save(duressPin: _duress);
+    }
+  }
+
+  Future<void> _skipDuress() async {
+    if (_saving || _step != _ShieldStep.enterDuress) return;
+    await _save(duressPin: null);
+  }
+
+  /// Persists both PINs through the hashing service and closes the sheet.
+  Future<void> _save({required String? duressPin}) async {
+    setState(() => _saving = true);
+    try {
+      await LockService().setupSecurity(normalPin: _primary, duressPin: duressPin);
+      if (mounted) Navigator.pop(context, true);
+    } on ArgumentError catch (e) {
+      // Service-level validation failure — restart the flow cleanly.
+      if (mounted) {
+        setState(() {
+          _saving = false;
+          _error = e.message?.toString() ?? 'INVALID PIN';
+          _entered = '';
+          _primary = '';
+          _duress = '';
+          _step = _ShieldStep.enterPrimary;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canConfirm = _entered.length >= _minDigits && !_saving;
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: Container(
+        decoration: const BoxDecoration(
+          color: voidBlack,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          border: Border(top: BorderSide(color: emeraldGlow)),
+        ),
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+        child: SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 40,
+                height: 3,
+                decoration: BoxDecoration(
+                  color: textDim,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.shield_rounded, color: emeraldGlow, size: 16),
+                  const SizedBox(width: 8),
+                  Text(
+                    'ARM COERCION SHIELD',
+                    style: GoogleFonts.rajdhani(
+                      color: textBright,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _statusText,
+                style: GoogleFonts.jetBrainsMono(
+                  fontSize: 10,
+                  letterSpacing: 2,
+                  color: _error != null ? Colors.redAccent : cyberCyan.withAlpha(160),
+                ),
+              ),
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    _error!,
+                    style: GoogleFonts.jetBrainsMono(
+                      fontSize: 9,
+                      color: Colors.redAccent,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 18),
+              PinDots(filledCount: _entered.length, dotCount: _maxDigits),
+              const SizedBox(height: 22),
+              PinKeypad(
+                onDigit: _onDigit,
+                onBackspace: _onBackspace,
+              ),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  if (_step == _ShieldStep.enterDuress)
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: _saving ? null : _skipDuress,
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(color: textDim.withAlpha(60)),
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                        child: Text('SKIP',
+                            style: GoogleFonts.rajdhani(
+                                color: textMid,
+                                letterSpacing: 1.5,
+                                fontWeight: FontWeight.w700)),
+                      ),
+                    )
+                  else
+                    const Spacer(),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: canConfirm ? _confirmSegment : null,
+                      icon: Icon(_isConfirmStep ? Icons.check_rounded : Icons.arrow_forward_rounded,
+                          size: 14, color: emeraldGlow),
+                      label: Text(_isConfirmStep ? 'CONFIRM' : 'NEXT',
+                          style: GoogleFonts.rajdhani(
+                              color: emeraldGlow,
+                              letterSpacing: 1.5,
+                              fontWeight: FontWeight.w700)),
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(
+                            color: emeraldGlow.withAlpha(canConfirm ? 60 : 20)),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  bool get _isConfirmStep =>
+      _step == _ShieldStep.confirmPrimary || _step == _ShieldStep.confirmDuress;
 }

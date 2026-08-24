@@ -144,7 +144,9 @@ final personaNotifierProvider = NotifierProvider<PersonaNotifier, Persona>(
 // ═══════════════════════════════════════════════════════════════════════════
 
 class NeonThemeNotifier extends Notifier<NeonTheme> {
-  static const _prefKey = 'kamui_neon_theme_index';
+  /// Persisted via [KamuiConstants.themePrefsKey] so a duress wipe
+  /// (DatabaseService.nuke) can clear it.
+  static const _prefKey = KamuiConstants.themePrefsKey;
 
   @override
   NeonTheme build() {
