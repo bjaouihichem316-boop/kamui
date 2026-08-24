@@ -3,7 +3,10 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:cryptography/cryptography.dart';
 import 'double_ratchet.dart';
+import 'crypto_service.dart';
+import 'database_service.dart';
 import 'identity_key_service.dart';
+import 'session_store.dart';
 import 'x3dh_service.dart';
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -88,15 +91,27 @@ class SessionManager {
   factory SessionManager() => _instance;
 
   final IdentityKeyService Function() _getIdentityService;
+  final SessionStore Function() _getSessionStore;
 
-  SessionManager._internal({IdentityKeyService? identityService})
-      : _getIdentityService = identityService != null
+  SessionManager._internal({
+    IdentityKeyService? identityService,
+    SessionStore? sessionStore,
+  })  : _getIdentityService = identityService != null
             ? (() => identityService)
-            : (() => IdentityKeyService());
+            : (() => IdentityKeyService()),
+        _getSessionStore = sessionStore != null
+            ? (() => sessionStore)
+            : (() => SqliteSessionStore(DatabaseService(), CryptoService()));
 
   /// Factory for isolated instances in tests or multi-identity scenarios.
-  factory SessionManager.isolated({IdentityKeyService? identityService}) {
-    return SessionManager._internal(identityService: identityService);
+  factory SessionManager.isolated({
+    IdentityKeyService? identityService,
+    SessionStore? sessionStore,
+  }) {
+    return SessionManager._internal(
+      identityService: identityService,
+      sessionStore: sessionStore,
+    );
   }
 
   // Active v4 Double Ratchet sessions
@@ -158,12 +173,19 @@ class SessionManager {
     );
 
     _v4Sessions[conversationId] = session;
+    // Transactional commit point — responder session accepted: persist.
+    await _persistSession(session);
     return session;
   }
 
   /// Retrieves or establishes a **v4 Double Ratchet** session for [conversationId].
   ///
   /// Requires [peerPreKeyBundleJson] (v3 JSON from [IdentityKeyService.parseHandshakePayload]).
+  /// Resolution order:
+  /// 1. Live in-memory session.
+  /// 2. Persisted encrypted ratchet state (restored after app restart).
+  /// 3. Fresh X3DH handshake against the peer bundle.
+  ///
   /// Returns the [DoubleRatchetSession], or `null` if keys are unavailable.
   Future<DoubleRatchetSession?> getOrCreateV4Session(
     String conversationId, {
@@ -171,6 +193,14 @@ class SessionManager {
   }) async {
     if (_v4Sessions.containsKey(conversationId)) {
       return _v4Sessions[conversationId];
+    }
+
+    // Lazy-restore persisted ratchet state BEFORE attempting a fresh X3DH —
+    // re-running the handshake would desync both sides' counters.
+    final restored = await _restorePersistedSession(conversationId);
+    if (restored != null) {
+      _v4Sessions[conversationId] = restored;
+      return restored;
     }
 
     final identityService = _getIdentityService();
@@ -225,11 +255,21 @@ class SessionManager {
       await identityService.init();
     }
 
-    // 1. If session already exists, encrypt normally
-    if (_v4Sessions.containsKey(conversationId)) {
-      final session = _v4Sessions[conversationId]!;
+    // 1. Live session, or lazily-restored persisted state?
+    //    (Restart mid-conversation must resume ratcheting — never re-handshake.)
+    var session = _v4Sessions[conversationId];
+    if (session == null) {
+      session = await _restorePersistedSession(conversationId);
+      if (session != null) {
+        _v4Sessions[conversationId] = session;
+      }
+    }
+    if (session != null) {
       try {
-        return await session.encrypt(plaintext);
+        final wire = await session.encrypt(plaintext);
+        // Transactional commit point — ratchet state advanced: persist.
+        await _persistSession(session);
+        return wire;
       } on RatchetException catch (e) {
         throw SessionUnavailableException('v4 encryption failed: ${e.reason}');
       }
@@ -272,9 +312,14 @@ class SessionManager {
       );
 
       _v4Sessions[conversationId] = session;
+      // Transactional commit point — new initiator session: persist.
+      await _persistSession(session);
 
       // Encrypt the first message with the new ratchet session
       final firstMessage = await session.encrypt(plaintext);
+      // Sending chain advanced — persist again so a restart mid-handshake
+      // never replays an already-used chain position.
+      await _persistSession(session);
 
       // Cryptographically bind IK_ed and IK_dh with Ed25519 signature
       final ikEdBytes  = base64Decode(identityService.identityEdPublicKeyB64!);
@@ -376,6 +421,8 @@ class SessionManager {
           await identityService.consumeOpk(envelope.opkIdUsed!);
         }
         _v4Sessions[conversationId] = candidateBobSession;
+        // Transactional commit point — new responder session: persist.
+        await _persistSession(candidateBobSession);
 
         return plaintext;
       } on SessionUnavailableException {
@@ -390,7 +437,15 @@ class SessionManager {
     }
 
     // 2. Normal established session message ("kamui_v4:...")
+    //    Try live state first, then lazily-restored persisted ratchet state,
+    //    then (when a bundle is available) a fresh X3DH establishment.
     DoubleRatchetSession? session = _v4Sessions[conversationId];
+    if (session == null) {
+      session = await _restorePersistedSession(conversationId);
+      if (session != null) {
+        _v4Sessions[conversationId] = session;
+      }
+    }
     if (session == null && peerPreKeyBundleJson != null && peerPreKeyBundleJson.isNotEmpty) {
       session = await getOrCreateV4Session(
         conversationId,
@@ -405,7 +460,10 @@ class SessionManager {
     }
 
     try {
-      return await session.decrypt(wirePayload);
+      final plaintext = await session.decrypt(wirePayload);
+      // Transactional commit point — receive chain advanced: persist.
+      await _persistSession(session);
+      return plaintext;
     } on RatchetException catch (e) {
       throw SessionUnavailableException('v4 decryption failed: ${e.reason}');
     }
@@ -504,13 +562,65 @@ class SessionManager {
     return null;
   }
 
-  /// Resets all active sessions (use during duress wipe / key rotation).
-  void reset() {
+  /// Resets all active sessions and deletes all persisted ratchet state
+  /// (duress wipe / key rotation).
+  Future<void> reset() async {
     _v4Sessions.clear();
     _v2Sessions.clear();
+    try {
+      await _getSessionStore().deleteAll();
+    } catch (_) {
+      // Store already gone (e.g. DB file nuked first) — nothing left to delete.
+    }
   }
 
   // ── Private helpers ───────────────────────────────────────────────────────
+
+  /// Serializes [session] and writes it AES-256-GCM-encrypted to the store.
+  ///
+  /// MUST only be called at transactional commit points (never from candidate
+  /// state). Persistence is best-effort: an IO failure is swallowed because a
+  /// healthy in-memory session must never be killed by storage trouble.
+  Future<void> _persistSession(DoubleRatchetSession session) async {
+    try {
+      final json = await session.toPersistentJson();
+      await _getSessionStore().saveEncryptedState(
+        session.conversationId,
+        jsonEncode(json),
+      );
+    } catch (_) {
+      // Best-effort persistence — see docstring.
+    }
+  }
+
+  /// Loads, decrypts, and deserializes the persisted ratchet state for
+  /// [conversationId].
+  ///
+  /// Corrupt / tampered / undecryptable blobs are deleted and yield `null` —
+  /// the caller then falls back to a fresh X3DH handshake. Never crashes,
+  /// never returns a half-valid session.
+  Future<DoubleRatchetSession?> _restorePersistedSession(String conversationId) async {
+    try {
+      final decrypted = await _getSessionStore().loadEncryptedState(conversationId);
+      if (decrypted == null) return null;
+
+      final map = jsonDecode(decrypted);
+      if (map is! Map<String, dynamic>) {
+        throw const FormatException('Persisted ratchet state is not a JSON object.');
+      }
+      final session = await DoubleRatchetSession.fromPersistentJson(map);
+      if (session.conversationId != conversationId) {
+        throw const FormatException('Persisted ratchet state conversation mismatch.');
+      }
+      return session;
+    } catch (_) {
+      // Any corruption → discard blob so fresh X3DH can proceed cleanly.
+      try {
+        await _getSessionStore().delete(conversationId);
+      } catch (_) {}
+      return null;
+    }
+  }
 
   /// Establishes a v4 Double Ratchet session via X3DH → DoubleRatchetSession.initAlice.
   Future<DoubleRatchetSession?> _establishV4Session(
@@ -544,6 +654,8 @@ class SessionManager {
       );
 
       _v4Sessions[conversationId] = session;
+      // Transactional commit point — new initiator session: persist.
+      await _persistSession(session);
       return session;
     } on X3dhException catch (e) {
       throw SessionUnavailableException('X3DH handshake failed: ${e.reason}');

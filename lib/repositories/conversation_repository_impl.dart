@@ -32,6 +32,8 @@ class ConversationRepositoryImpl implements ConversationRepository {
         ct.avatar_initial,
         ct.status,
         ct.last_seen,
+        ct.identity_public_key,
+        ct.pre_key_bundle_json,
         m.id             AS msg_id,
         m.encrypted_text,
         m.timestamp      AS msg_ts,
@@ -57,19 +59,35 @@ class ConversationRepositoryImpl implements ConversationRepository {
     final database = await _db.db;
     final now = DateTime.now().millisecondsSinceEpoch;
 
-    // Upsert contact
-    await database.insert(
-      'contacts',
-      {
-        'id':            conversation.contact.id,
-        'name':          conversation.contact.name,
-        'destination':   conversation.contact.destination,
-        'avatar_initial': conversation.contact.avatarInitial,
-        'status':        conversation.contact.status.name,
-        'last_seen':     conversation.contact.lastSeen?.millisecondsSinceEpoch,
-        'created_at':    now,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
+    // Upsert contact. Uses ON CONFLICT with COALESCE so re-saving a bare
+    // in-memory Contact (e.g. auto-created from an inbound message) never
+    // nulls out previously persisted identity keys / PreKeyBundle.
+    await database.execute(
+      '''
+      INSERT INTO contacts (
+        id, name, destination, avatar_initial, status, last_seen,
+        identity_public_key, pre_key_bundle_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name                = excluded.name,
+        destination         = excluded.destination,
+        avatar_initial      = excluded.avatar_initial,
+        status              = excluded.status,
+        last_seen           = excluded.last_seen,
+        identity_public_key = COALESCE(excluded.identity_public_key, identity_public_key),
+        pre_key_bundle_json = COALESCE(excluded.pre_key_bundle_json, pre_key_bundle_json)
+      ''',
+      [
+        conversation.contact.id,
+        conversation.contact.name,
+        conversation.contact.destination,
+        conversation.contact.avatarInitial,
+        conversation.contact.status.name,
+        conversation.contact.lastSeen?.millisecondsSinceEpoch,
+        conversation.contact.identityPublicKey,
+        conversation.contact.preKeyBundleJson,
+        now,
+      ],
     );
 
     // Upsert conversation
@@ -110,6 +128,8 @@ class ConversationRepositoryImpl implements ConversationRepository {
       id:            row['contact_id'] as String,
       name:          row['name']       as String,
       destination:   row['destination'] as String,
+      identityPublicKey: row['identity_public_key'] as String?,
+      preKeyBundleJson:  row['pre_key_bundle_json'] as String?,
       avatarInitial: row['avatar_initial'] as String,
       status: ContactStatus.values.firstWhere(
         (e) => e.name == (row['status'] as String? ?? 'offline'),

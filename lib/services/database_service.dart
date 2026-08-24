@@ -20,7 +20,7 @@ class DatabaseService {
   DatabaseService._internal();
 
   static const _dbName    = 'kamui.db';
-  static const _dbVersion = 2;
+  static const _dbVersion = 3;
 
   Database? _db;
 
@@ -47,13 +47,15 @@ class DatabaseService {
   Future<void> _onCreate(Database db, int version) async {
     await db.execute('''
       CREATE TABLE contacts (
-        id              TEXT PRIMARY KEY,
-        name            TEXT NOT NULL,
-        destination     TEXT NOT NULL UNIQUE,
-        avatar_initial  TEXT NOT NULL DEFAULT '?',
-        status          TEXT NOT NULL DEFAULT 'offline',
-        last_seen       INTEGER,
-        created_at      INTEGER NOT NULL
+        id                   TEXT PRIMARY KEY,
+        name                 TEXT NOT NULL,
+        destination          TEXT NOT NULL UNIQUE,
+        avatar_initial       TEXT NOT NULL DEFAULT '?',
+        status               TEXT NOT NULL DEFAULT 'offline',
+        last_seen            INTEGER,
+        identity_public_key  TEXT,
+        pre_key_bundle_json  TEXT,
+        created_at           INTEGER NOT NULL
       )
     ''');
 
@@ -86,6 +88,32 @@ class DatabaseService {
     await db.execute('CREATE INDEX idx_messages_conv ON messages (conversation_id, timestamp)');
     await db.execute('CREATE INDEX idx_messages_expires ON messages (expires_at)');
     await db.execute('CREATE INDEX idx_convs_updated ON conversations (updated_at DESC)');
+
+    await _createV3Tables(db);
+  }
+
+  /// Tables introduced in schema v3: encrypted Double Ratchet session store
+  /// and the failed-send outbox. Shared by [_onCreate] and [_onUpgrade].
+  Future<void> _createV3Tables(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sessions (
+        conversation_id  TEXT PRIMARY KEY,
+        encrypted_state  TEXT NOT NULL,
+        updated_at       INTEGER NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE outbox (
+        id                TEXT PRIMARY KEY,
+        conversation_id   TEXT NOT NULL,
+        destination       TEXT NOT NULL,
+        encrypted_payload TEXT NOT NULL,
+        created_at        INTEGER NOT NULL,
+        retry_count       INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_outbox_created ON outbox (created_at)');
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -93,6 +121,12 @@ class DatabaseService {
       await db.execute('ALTER TABLE messages ADD COLUMN ttl_seconds INTEGER');
       await db.execute('ALTER TABLE messages ADD COLUMN expires_at INTEGER');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages (expires_at)');
+    }
+    if (oldVersion < 3) {
+      // Persisted peer identity keys + PreKeyBundles (v4 sessions survive restart).
+      await db.execute('ALTER TABLE contacts ADD COLUMN identity_public_key TEXT');
+      await db.execute('ALTER TABLE contacts ADD COLUMN pre_key_bundle_json TEXT');
+      await _createV3Tables(db);
     }
   }
 
@@ -126,8 +160,10 @@ class DatabaseService {
     // 3. Cancel all active OS notifications
     await NotificationService().cancelAllNotifications();
 
-    // 4. Reset in-memory cryptographic sessions & identity keys
-    SessionManager().reset();
+    // 4. Reset in-memory cryptographic sessions & identity keys.
+    //    reset() also deletes persisted ratchet state; the whole DB file is
+    //    already gone (step 1), so `sessions`/`outbox` die with it either way.
+    await SessionManager().reset();
     await IdentityKeyService().clearKeys();
 
     // 5. Clear application cache directory

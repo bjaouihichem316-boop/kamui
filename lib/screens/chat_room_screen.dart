@@ -118,6 +118,7 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
       timestamp:      now,
       isSent:         true,
       isEncrypted:    true,
+      status:         MessageStatus.sending,
       ttlSeconds:     _ttlSeconds > 0 ? _ttlSeconds : null,
       expiresAt:      expiresAt,
     );
@@ -130,9 +131,63 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
         .read(messagesProvider(widget.conversation.id).notifier)
         .addAndPersist(msg);
 
-    // Transmit encrypted payload via live SAM Service
+    // Transmit encrypted payload via live SAM Service. On failure the wire
+    // payload is queued in the outbox and the message is marked failed
+    // (long-press to retry; auto-retried once on SAM reconnect).
     final sam = ref.read(samServiceProvider);
-    await sam.sendRawMessage(widget.conversation.contact.destination, encryptedPayload);
+    final destination = widget.conversation.contact.destination;
+    final delivered = await sam.sendRawMessage(destination, encryptedPayload);
+
+    if (delivered) {
+      await ref
+          .read(messagesProvider(widget.conversation.id).notifier)
+          .updateStatus(msg.id, MessageStatus.sent);
+    } else {
+      await ref.read(outboxServiceProvider).enqueue(
+            id:              msg.id,
+            conversationId:  widget.conversation.id,
+            destination:     destination,
+            encryptedPayload: encryptedPayload,
+          );
+      await ref
+          .read(messagesProvider(widget.conversation.id).notifier)
+          .updateStatus(msg.id, MessageStatus.failed);
+    }
+  }
+
+  /// Long-press retry for a failed send: re-transmits the stored wire payload
+  /// from the outbox exactly once.
+  Future<void> _retryFailed(Message message) async {
+    final sent = await ref
+        .read(outboxServiceProvider)
+        .retryOne(
+          message.id,
+          (entry) => ref
+              .read(samServiceProvider)
+              .sendRawMessage(entry.destination, entry.encryptedPayload),
+        );
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    if (sent) {
+      await ref
+          .read(messagesProvider(widget.conversation.id).notifier)
+          .updateStatus(message.id, MessageStatus.sent);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('Retransmitted via garlic tunnel.',
+              style: GoogleFonts.jetBrainsMono(fontSize: 11)),
+          backgroundColor: cyberCyan.withAlpha(200),
+        ),
+      );
+    } else {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('Retry failed — SAM tunnel still offline.',
+              style: GoogleFonts.jetBrainsMono(fontSize: 11)),
+          backgroundColor: vortexOrange,
+        ),
+      );
+    }
   }
 
   void _scrollToBottom() {
@@ -233,6 +288,10 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen>
                             ttlSeconds:        m.ttlSeconds,
                             expiresAt:         m.expiresAt,
                             remainingFraction: m.remainingFraction,
+                            isFailed:          m.isSent && m.status == MessageStatus.failed,
+                            onRetry: (m.isSent && m.status == MessageStatus.failed)
+                                ? () => _retryFailed(m)
+                                : null,
                           );
                         },
                       ),

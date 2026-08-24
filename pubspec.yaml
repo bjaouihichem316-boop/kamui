@@ -51,5 +51,8 @@ dev_dependencies:
   # Virtual-clock control for reconnect-backoff tests (sam_inbound_test).
   fake_async: ^1.3.3
 
+  # Real SQLite engine for migration / persistence tests (no platform channels).
+  sqflite_common_ffi: ^2.3.0
+
 flutter:
   uses-material-design: true

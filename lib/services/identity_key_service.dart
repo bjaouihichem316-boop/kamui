@@ -4,6 +4,13 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'x3dh_service.dart';
 
+/// Number of One-Time PreKeys maintained in the local pool.
+///
+/// All `(id → pub)` pairs are embedded in every published PreKeyBundle so ONE
+/// QR exchange satisfies multiple offline handshakes. [IdentityKeyService]
+/// replenishes the pool back to this size after every consumption.
+const int kOpkPoolSize = 8;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // IdentityKeyService
 // ══════════════════════════════════════════════════════════════════════════════
@@ -46,6 +53,7 @@ class IdentityKeyService {
   static const _opkPrivAlias   = 'kamui_opk_x25519_priv';
   static const _opkPubAlias    = 'kamui_opk_x25519_pub';
   static const _opkIdAlias     = 'kamui_current_opk_id';
+  static const _opkRegistryAlias = 'kamui_opk_registry';
 
   // ─── Algorithms ──────────────────────────────────────────────────────────
   final _ed25519 = Ed25519();
@@ -57,10 +65,14 @@ class IdentityKeyService {
   SimpleKeyPair? _spkKeyPair;    // X25519 Signed PreKey
   List<int>?    _spkSigBytes;   // Ed25519 signature over SPK_pub
   
-  // OPK pool state (Phase 4 Invariants)
+  // OPK pool state (Phase 4 Invariants + Phase 2 pool expansion)
   final Map<int, SimpleKeyPair> _opkStore = {};
   final Set<int> _consumedOpkIds = {};
   int? _currentOpkId;
+
+  /// Cached base64 public keys per live OPK id — lets the synchronous bundle
+  /// builder expose the full pool without async key extraction.
+  final Map<int, String> _opkPubB64ById = {};
 
   String? _ikEdPubB64;
   String? _ikDhPubB64;
@@ -107,6 +119,9 @@ class IdentityKeyService {
   }
 
   /// Consumes [opkId] exactly once upon authenticated handshake completion.
+  ///
+  /// After consumption the pool is replenished back to [kOpkPoolSize] so a
+  /// single published bundle keeps satisfying multiple offline handshakes.
   Future<void> consumeOpk(int opkId) async {
     if (_consumedOpkIds.contains(opkId)) {
       throw X3dhException('One-time prekey (ID: $opkId) is already consumed.');
@@ -116,6 +131,7 @@ class IdentityKeyService {
     }
 
     _opkStore.remove(opkId);
+    _opkPubB64ById.remove(opkId);
     _consumedOpkIds.add(opkId);
 
     // Erase from secure storage
@@ -125,9 +141,31 @@ class IdentityKeyService {
     if (_currentOpkId == opkId) {
       _currentOpkId = null;
       _opkPubB64 = null;
-      // Replenish with a fresh OPK
+    }
+
+    // Maintain pool size + repoint the legacy mirror at a live key.
+    await _replenishPool();
+  }
+
+  /// Tops the OPK pool up to [kOpkPoolSize] and refreshes legacy mirror state.
+  Future<void> _replenishPool() async {
+    while (_opkStore.length < kOpkPoolSize) {
       await generateNewOpk();
     }
+    if (_currentOpkId == null || !_opkStore.containsKey(_currentOpkId)) {
+      final liveIds = _opkStore.keys.toList()..sort();
+      if (liveIds.isNotEmpty) {
+        final id  = liveIds.first;
+        final pub = await _opkStore[id]!.extractPublicKey();
+        _currentOpkId = id;
+        _opkPubB64    = base64Encode(pub.bytes);
+        await _secureStorage.write(key: _opkIdAlias,   value: id.toString());
+        await _secureStorage.write(key: _opkPrivAlias,
+            value: base64Encode(await _opkStore[id]!.extractPrivateKeyBytes()));
+        await _secureStorage.write(key: _opkPubAlias,  value: _opkPubB64!);
+      }
+    }
+    await _persistRegistry();
   }
 
   /// Generates a new fresh OPK in the pool with an incremented ID.
@@ -145,9 +183,22 @@ class IdentityKeyService {
     await _secureStorage.write(key: _opkIdAlias, value: nextId.toString());
 
     _opkStore[nextId] = opkKP;
+    _opkPubB64ById[nextId] = base64Encode(opkPub.bytes);
     _currentOpkId = nextId;
     _opkPubB64 = base64Encode(opkPub.bytes);
     return nextId;
+  }
+
+  /// Persists the live/consumed OPK id registry so the pool (and replay
+  /// protection for consumed ids) survives app restarts.
+  Future<void> _persistRegistry() async {
+    await _secureStorage.write(
+      key: _opkRegistryAlias,
+      value: jsonEncode({
+        'live':     _opkStore.keys.toList()..sort(),
+        'consumed': _consumedOpkIds.toList()..sort(),
+      }),
+    );
   }
 
   /// Legacy accessor — returns the X25519 DH identity keypair.
@@ -203,17 +254,58 @@ class IdentityKeyService {
       _spkSigBytes = base64Decode(spkSigB64);
 
       final activeId = int.tryParse(opkIdStr ?? '1') ?? 1;
-      _currentOpkId = activeId;
 
-      if (opkPrivB64 != null && opkPubB64 != null) {
-        final opkKp = SimpleKeyPairData(
-          base64Decode(opkPrivB64),
-          publicKey: SimplePublicKey(base64Decode(opkPubB64), type: KeyPairType.x25519),
-          type: KeyPairType.x25519,
-        );
-        _opkStore[activeId] = opkKp;
-        _opkPubB64 = opkPubB64;
+      final registryRaw = await _secureStorage.read(key: _opkRegistryAlias);
+      if (registryRaw != null) {
+        // ── Pool-aware restore (v3 keysets) ────────────────────────────────
+        try {
+          final reg = jsonDecode(registryRaw) as Map<String, dynamic>;
+          final liveIds =
+              (reg['live'] as List<dynamic>? ?? []).whereType<int>().toSet();
+          _consumedOpkIds.addAll(
+            (reg['consumed'] as List<dynamic>? ?? []).whereType<int>(),
+          );
+          for (final id in liveIds) {
+            final priv = await _secureStorage.read(key: 'kamui_opk_${id}_priv');
+            final pub  = await _secureStorage.read(key: 'kamui_opk_${id}_pub');
+            if (priv != null && pub != null) {
+              _opkStore[id] = SimpleKeyPairData(
+                base64Decode(priv),
+                publicKey: SimplePublicKey(base64Decode(pub), type: KeyPairType.x25519),
+                type: KeyPairType.x25519,
+              );
+              _opkPubB64ById[id] = pub;
+            }
+          }
+        } catch (_) {
+          // Corrupt registry → fall through to legacy single-OPK restore.
+          _opkStore.clear();
+          _consumedOpkIds.clear();
+          _opkPubB64ById.clear();
+        }
       }
+
+      if (_opkStore.isEmpty) {
+        // ── Legacy single-OPK restore (pre-pool keysets) ───────────────────
+        if (opkPrivB64 != null && opkPubB64 != null) {
+          final opkKp = SimpleKeyPairData(
+            base64Decode(opkPrivB64),
+            publicKey: SimplePublicKey(base64Decode(opkPubB64), type: KeyPairType.x25519),
+            type: KeyPairType.x25519,
+          );
+          _opkStore[activeId] = opkKp;
+          _opkPubB64ById[activeId] = opkPubB64;
+          _currentOpkId = activeId;
+          _opkPubB64 = opkPubB64;
+        }
+      } else if (_opkStore.containsKey(activeId)) {
+        _currentOpkId = activeId;
+        _opkPubB64 = _opkPubB64ById[activeId];
+      }
+
+      // Top the pool up to [kOpkPoolSize] — covers pre-pool keyset upgrades
+      // and partially-consumed pools after restart.
+      await _replenishPool();
     } else {
       await _generateFullKeyset();
     }
@@ -241,11 +333,21 @@ class IdentityKeyService {
     // 4. Sign SPK_pub with IK_ed_priv
     final spkSig = await _ed25519.sign(spkPub.bytes, keyPair: ikEdKP);
 
-    // 5. X25519 One-Time PreKey (initial ID: 1)
+    // 5. X25519 One-Time PreKey pool (N = kOpkPoolSize, IDs 1..N).
+    //    The whole pool is published in QR bundles so ONE exchange satisfies
+    //    multiple offline handshakes; consumption replenishes back to N.
     const initialOpkId = 1;
-    final opkKP  = await _x25519.newKeyPair();
-    final opkPub = await opkKP.extractPublicKey();
-    final opkPriv = await opkKP.extractPrivateKeyBytes();
+    for (var i = 1; i <= kOpkPoolSize; i++) {
+      final opkKP   = await _x25519.newKeyPair();
+      final opkPub  = await opkKP.extractPublicKey();
+      final opkPriv = await opkKP.extractPrivateKeyBytes();
+
+      await _secureStorage.write(key: 'kamui_opk_${i}_priv', value: base64Encode(opkPriv));
+      await _secureStorage.write(key: 'kamui_opk_${i}_pub',  value: base64Encode(opkPub.bytes));
+
+      _opkStore[i] = opkKP;
+      _opkPubB64ById[i] = base64Encode(opkPub.bytes);
+    }
 
     // Persist to secure storage
     await _secureStorage.write(key: _ikEdPrivAlias, value: base64Encode(ikEdPriv));
@@ -255,11 +357,14 @@ class IdentityKeyService {
     await _secureStorage.write(key: _spkPrivAlias,  value: base64Encode(spkPriv));
     await _secureStorage.write(key: _spkPubAlias,   value: base64Encode(spkPub.bytes));
     await _secureStorage.write(key: _spkSigAlias,   value: base64Encode(spkSig.bytes));
+
+    // Legacy single-OPK mirror points at ID 1 for backward compatibility.
+    final initialOpkPubB64 = _opkPubB64ById[initialOpkId]!;
+    final initialOpkPriv = await _opkStore[initialOpkId]!.extractPrivateKeyBytes();
     await _secureStorage.write(key: _opkIdAlias,    value: initialOpkId.toString());
-    await _secureStorage.write(key: _opkPrivAlias,  value: base64Encode(opkPriv));
-    await _secureStorage.write(key: _opkPubAlias,   value: base64Encode(opkPub.bytes));
-    await _secureStorage.write(key: 'kamui_opk_${initialOpkId}_priv', value: base64Encode(opkPriv));
-    await _secureStorage.write(key: 'kamui_opk_${initialOpkId}_pub',  value: base64Encode(opkPub.bytes));
+    await _secureStorage.write(key: _opkPrivAlias,  value: base64Encode(initialOpkPriv));
+    await _secureStorage.write(key: _opkPubAlias,   value: initialOpkPubB64);
+    await _persistRegistry();
 
     // Update in-memory state
     _ikEdKeyPair  = ikEdKP;
@@ -270,8 +375,7 @@ class IdentityKeyService {
     _spkPubB64    = base64Encode(spkPub.bytes);
     _spkSigBytes  = spkSig.bytes;
     _currentOpkId = initialOpkId;
-    _opkStore[initialOpkId] = opkKP;
-    _opkPubB64    = base64Encode(opkPub.bytes);
+    _opkPubB64    = initialOpkPubB64;
   }
 
   /// Force-generates a new complete keyset (e.g. duress wipe, key rotation).
@@ -280,8 +384,9 @@ class IdentityKeyService {
     _isInitialized = true;
   }
 
-  /// Builds the local [PreKeyBundle] for sharing with peers (synchronous, no OPK).
-  /// For the full bundle including OPK, call [generatePreKeyBundleAsync] instead.
+  /// Builds the local [PreKeyBundle] for sharing with peers (synchronous).
+  /// Includes the full OPK pool via cached public keys. For the async variant
+  /// that extracts keys directly from keypairs, call [generatePreKeyBundleAsync].
   PreKeyBundle? generatePreKeyBundle() {
     final edPubB64 = _ikEdPubB64;
     final dhPubB64 = _ikDhPubB64;
@@ -299,10 +404,14 @@ class IdentityKeyService {
       spkSig:  spkSig,
       opkId:   _currentOpkId,
       opkPub:  _opkPubB64 != null ? base64Decode(_opkPubB64!) : null,
+      opks: {
+        for (final entry in _opkPubB64ById.entries)
+          entry.key: base64Decode(entry.value),
+      },
     );
   }
 
-  /// Async version that correctly extracts the OPK public key.
+  /// Async version that correctly extracts the OPK public keys.
   Future<PreKeyBundle?> generatePreKeyBundleAsync() async {
     if (_ikEdKeyPair == null || _ikDhKeyPair == null ||
         _spkKeyPair  == null || _spkSigBytes == null) {
@@ -317,6 +426,20 @@ class IdentityKeyService {
     if (_currentOpkId != null && _opkStore.containsKey(_currentOpkId)) {
       final opkPub = await _opkStore[_currentOpkId!]!.extractPublicKey();
       opkPubBytes  = opkPub.bytes;
+      _opkPubB64ById[_currentOpkId!] = base64Encode(opkPub.bytes);
+    }
+
+    // Full pool — extract any missing public keys directly from keypairs.
+    final poolPubs = <int, List<int>>{};
+    for (final entry in _opkStore.entries) {
+      final cached = _opkPubB64ById[entry.key];
+      if (cached != null) {
+        poolPubs[entry.key] = base64Decode(cached);
+      } else {
+        final pub = await entry.value.extractPublicKey();
+        _opkPubB64ById[entry.key] = base64Encode(pub.bytes);
+        poolPubs[entry.key] = pub.bytes;
+      }
     }
 
     return PreKeyBundle(
@@ -326,6 +449,7 @@ class IdentityKeyService {
       spkSig:  _spkSigBytes!,
       opkId:   _currentOpkId,
       opkPub:  opkPubBytes,
+      opks:    poolPubs,
     );
   }
 
@@ -342,8 +466,9 @@ class IdentityKeyService {
   ///   "ik_dh":   "<base64 X25519 DH pub>",
   ///   "spk":     "<base64 X25519 SPK pub>",
   ///   "spk_sig": "<base64 Ed25519 sig of SPK pub>",
-  ///   "opk_id":  1,                          // optional
-  ///   "opk":     "<base64 X25519 OPK pub>"   // optional
+  ///   "opk_id":  1,                          // optional (legacy mirror)
+  ///   "opk":     "<base64 X25519 OPK pub>",  // optional (legacy mirror)
+  ///   "opks":    {"1": "<b64 pub>", ...}     // optional full OPK pool
   /// }
   /// ```
   Future<String> generateHandshakePayloadAsync(String destinationKey) async {
@@ -396,7 +521,8 @@ class IdentityKeyService {
           decoded.containsKey('ik_dh')   &&
           decoded.containsKey('spk')     &&
           decoded.containsKey('spk_sig')) {
-        // v3 — full PreKeyBundle embedded
+        // v3 — full PreKeyBundle embedded (with optional OPK pool)
+        final rawOpks = decoded['opks'];
         final bundle = PreKeyBundle(
           ikPubEd: base64Decode(decoded['ik_ed']   as String),
           ikPubDh: base64Decode(decoded['ik_dh']   as String),
@@ -406,6 +532,13 @@ class IdentityKeyService {
           opkPub:  decoded['opk'] != null
                    ? base64Decode(decoded['opk'] as String)
                    : null,
+          opks: rawOpks is Map
+              ? {
+                  for (final entry in rawOpks.entries)
+                    int.parse(entry.key as String):
+                        base64Decode(entry.value as String),
+                }
+              : const {},
         );
         return {
           'destination':       dest,
@@ -439,6 +572,7 @@ class IdentityKeyService {
       _ikDhPrivAlias, _ikDhPubAlias,
       _spkPrivAlias,  _spkPubAlias,  _spkSigAlias,
       _opkIdAlias,    _opkPrivAlias, _opkPubAlias,
+      _opkRegistryAlias,
     ]) {
       await _secureStorage.delete(key: alias);
     }
@@ -459,6 +593,7 @@ class IdentityKeyService {
     _ikDhKeyPair  = null;
     _spkKeyPair   = null;
     _opkStore.clear();
+    _opkPubB64ById.clear();
     _consumedOpkIds.clear();
     _currentOpkId = null;
     _spkSigBytes  = null;

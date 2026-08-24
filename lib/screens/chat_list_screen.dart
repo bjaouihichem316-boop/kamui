@@ -34,6 +34,8 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
   @override
   Widget build(BuildContext context) {
     ref.watch(incomingMessageListenerProvider);
+    // Auto-retry queued (failed) sends once per SAM reconnect.
+    ref.watch(outboxRetryListenerProvider);
     final asyncConvs = ref.watch(conversationsProvider);
 
     return Scaffold(

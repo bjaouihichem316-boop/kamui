@@ -14,6 +14,13 @@ class ChatBubble extends StatelessWidget {
   final DateTime? expiresAt;
   final double remainingFraction;
 
+  /// True for outgoing messages whose SAM transmission failed — renders a
+  /// warning glyph instead of the delivery checkmarks.
+  final bool isFailed;
+
+  /// Long-press handler (used to retry failed sends from the outbox).
+  final VoidCallback? onRetry;
+
   const ChatBubble({
     super.key,
     required this.message,
@@ -23,13 +30,15 @@ class ChatBubble extends StatelessWidget {
     this.ttlSeconds,
     this.expiresAt,
     this.remainingFraction = 1.0,
+    this.isFailed          = false,
+    this.onRetry,
   });
 
   @override
   Widget build(BuildContext context) {
     final hasTtl = expiresAt != null;
 
-    return Padding(
+    final bubble = Padding(
       padding: EdgeInsets.only(
         left:   isSent ? 56 : 16,
         right:  isSent ? 16 : 56,
@@ -107,11 +116,18 @@ class ChatBubble extends StatelessWidget {
                       ),
                       if (isSent) ...[
                         const SizedBox(width: 4),
-                        Icon(
-                          Icons.done_all,
-                          size:  10,
-                          color: cyberCyan.withAlpha(140),
-                        ),
+                        if (isFailed)
+                          const Icon(
+                            Icons.error_outline,
+                            size:  11,
+                            color: Colors.redAccent,
+                          )
+                        else
+                          Icon(
+                            Icons.done_all,
+                            size:  10,
+                            color: cyberCyan.withAlpha(140),
+                          ),
                       ],
                     ],
                   ),
@@ -136,6 +152,10 @@ class ChatBubble extends StatelessWidget {
         ),
       ),
     );
+
+    // Long-press retry affordance for failed sends (outbox).
+    if (onRetry == null) return bubble;
+    return GestureDetector(onLongPress: onRetry, child: bubble);
   }
 
   BorderRadius get _borderRadius => BorderRadius.only(

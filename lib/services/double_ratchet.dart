@@ -15,6 +15,9 @@ const int kMaxSkip = 1000;
 /// 30 minutes covers transient network reordering without leaking long-term state.
 const int kSkippedKeyTtlMs = 30 * 60 * 1000;
 
+/// Schema version of the serialized Double Ratchet persistence format.
+const int kPersistentStateVersion = 1;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // HKDF primitives (shared across ratchet operations)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -144,6 +147,59 @@ class SkippedKeyStore {
 
   /// Clears all stored skipped keys.
   void clear() => _store.clear();
+
+  /// Exports every live entry (including original creation timestamps) for
+  /// encrypted persistence. Timestamps MUST survive a round-trip so TTL
+  /// semantics remain intact across app restarts.
+  List<Map<String, dynamic>> exportEntries() {
+    _pruneExpired();
+    return [
+      for (final entry in _store.entries)
+        <String, dynamic>{
+          'dh':         base64Encode(entry.key.dhPub),
+          'n':          entry.key.msgN,
+          'key':        base64Encode(entry.value.key),
+          'created_ms': entry.value.createdMs,
+        },
+    ];
+  }
+
+  /// Restores entries produced by [exportEntries], preserving their original
+  /// creation timestamps. Throws [RatchetException] on any malformed input —
+  /// callers treat the whole blob as corrupt and discard it (fail-closed).
+  void restoreEntries(List<dynamic> entries) {
+    for (final raw in entries) {
+      if (raw is! Map<String, dynamic>) {
+        throw const RatchetException('Malformed skipped-key entry: not an object.');
+      }
+      final dhB64     = raw['dh'];
+      final msgN      = raw['n'];
+      final keyB64    = raw['key'];
+      final createdMs = raw['created_ms'];
+      if (dhB64 is! String || msgN is! int || keyB64 is! String || createdMs is! int) {
+        throw const RatchetException(
+          'Malformed skipped-key entry: missing or invalid fields.',
+        );
+      }
+      if (msgN < 0 || msgN > kMaxSkip) {
+        throw RatchetException('Malformed skipped-key entry: invalid n=$msgN.');
+      }
+      final Uint8List dh;
+      final Uint8List key;
+      try {
+        dh  = Uint8List.fromList(base64Decode(dhB64));
+        key = Uint8List.fromList(base64Decode(keyB64));
+      } catch (e) {
+        throw RatchetException('Malformed skipped-key entry: bad Base64 ($e).');
+      }
+      if (dh.length != 32) {
+        throw RatchetException(
+          'Malformed skipped-key entry: dh length ${dh.length} (expected 32).',
+        );
+      }
+      _store[SkippedKeyIndex(dh, msgN)] = _SkippedEntry(key, createdMs);
+    }
+  }
 
   void _pruneExpired() {
     final cutoff = _nowMs() - kSkippedKeyTtlMs;
@@ -613,6 +669,154 @@ class DoubleRatchetSession {
 
   /// Number of skipped message keys currently in the store.
   int get skippedKeyCount => _skipped.length;
+
+  // ── Persistence (serialize ONLY at transactional commit points) ──────────
+
+  /// Serializes the complete ratchet state for encrypted persistence.
+  ///
+  /// **SECURITY INVARIANT**: callers MUST invoke this only AFTER a transactional
+  /// commit (post-encryption, post-authenticated-decrypt, or session creation).
+  /// Serializing candidate state would persist unauthenticated key material and
+  /// break the rollback guarantees of [decrypt].
+  ///
+  /// Format version 1 covers: root key, both chain keys, the local ratchet
+  /// keypair (private + public), peer ratchet public, all counters, and every
+  /// skipped message key with its original TTL creation timestamp.
+  Future<Map<String, dynamic>> toPersistentJson() async {
+    final dhSPub  = await _dhS.extractPublicKey();
+    final dhSPriv = await _dhS.extractPrivateKeyBytes();
+
+    return <String, dynamic>{
+      'version':          kPersistentStateVersion,
+      'conversation_id':  conversationId,
+      'peer_ik':          peerIdentityPublicKeyB64,
+      'rk':               base64Encode(_rk),
+      if (_cks != null) 'cks': base64Encode(_cks!),
+      if (_ckr != null) 'ckr': base64Encode(_ckr!),
+      'dh_s_priv':        base64Encode(dhSPriv),
+      'dh_s_pub':         base64Encode(dhSPub.bytes),
+      if (_peerRatchetPub != null)
+        'peer_ratchet_pub': base64Encode(_peerRatchetPub!),
+      'ns':               _ns,
+      'nr':               _nr,
+      'pns':              _pns,
+      'skipped':          _skipped.exportEntries(),
+    };
+  }
+
+  /// Reconstructs a session from [toPersistentJson] output.
+  ///
+  /// Throws [RatchetException] on ANY malformation — callers must treat the
+  /// entire blob as corrupt, discard it, and re-establish via fresh X3DH.
+  /// Never partial: either a fully valid session is returned or an exception.
+  static Future<DoubleRatchetSession> fromPersistentJson(
+    Map<String, dynamic> json,
+  ) async {
+    if (json['version'] != kPersistentStateVersion) {
+      throw RatchetException(
+        'Unsupported persistent ratchet state version: ${json['version']} '
+        '(expected $kPersistentStateVersion).',
+      );
+    }
+
+    final conversationId = json['conversation_id'];
+    final peerIk         = json['peer_ik'];
+    final rkB64          = json['rk'];
+    final dhSPrivB64     = json['dh_s_priv'];
+    final dhSPubB64      = json['dh_s_pub'];
+    final ns             = json['ns'];
+    final nr             = json['nr'];
+    final pns            = json['pns'];
+    final skipped        = json['skipped'];
+
+    if (conversationId is! String || conversationId.isEmpty) {
+      throw const RatchetException('Malformed persistent state: conversation_id.');
+    }
+    if (peerIk is! String || peerIk.isEmpty) {
+      throw const RatchetException('Malformed persistent state: peer_ik.');
+    }
+    if (rkB64 is! String || dhSPrivB64 is! String || dhSPubB64 is! String) {
+      throw const RatchetException('Malformed persistent state: missing key material.');
+    }
+    if (ns is! int || nr is! int || pns is! int || ns < 0 || nr < 0 || pns < 0) {
+      throw const RatchetException('Malformed persistent state: counters.');
+    }
+    if (skipped is! List<dynamic>) {
+      throw const RatchetException('Malformed persistent state: skipped keys.');
+    }
+
+    final Uint8List rk;
+    final Uint8List dhSPriv;
+    final Uint8List dhSPub;
+    try {
+      rk      = Uint8List.fromList(base64Decode(rkB64));
+      dhSPriv = Uint8List.fromList(base64Decode(dhSPrivB64));
+      dhSPub  = Uint8List.fromList(base64Decode(dhSPubB64));
+    } catch (e) {
+      throw RatchetException('Malformed persistent state: bad Base64 ($e).');
+    }
+
+    if (rk.length != 32) {
+      throw RatchetException('Malformed persistent state: rk length ${rk.length}.');
+    }
+    if (dhSPriv.length != 32 || dhSPub.length != 32) {
+      throw RatchetException(
+        'Malformed persistent state: dhS lengths priv=${dhSPriv.length} pub=${dhSPub.length}.',
+      );
+    }
+
+    Uint8List? cks;
+    Uint8List? ckr;
+    List<int>? peerRatchetPub;
+    try {
+      if (json['cks'] is String) {
+        cks = Uint8List.fromList(base64Decode(json['cks'] as String));
+      }
+      if (json['ckr'] is String) {
+        ckr = Uint8List.fromList(base64Decode(json['ckr'] as String));
+      }
+      if (json['peer_ratchet_pub'] is String) {
+        peerRatchetPub = base64Decode(json['peer_ratchet_pub'] as String);
+      }
+    } catch (e) {
+      throw RatchetException('Malformed persistent state: optional fields ($e).');
+    }
+    if (cks != null && cks.length != 32) {
+      throw RatchetException('Malformed persistent state: cks length ${cks.length}.');
+    }
+    if (ckr != null && ckr.length != 32) {
+      throw RatchetException('Malformed persistent state: ckr length ${ckr.length}.');
+    }
+    if (peerRatchetPub != null && peerRatchetPub.length != 32) {
+      throw RatchetException(
+        'Malformed persistent state: peer_ratchet_pub length ${peerRatchetPub.length}.',
+      );
+    }
+
+    final dhS = SimpleKeyPairData(
+      dhSPriv,
+      publicKey: SimplePublicKey(dhSPub, type: KeyPairType.x25519),
+      type:      KeyPairType.x25519,
+    );
+
+    final session = DoubleRatchetSession._(
+      conversationId:           conversationId,
+      peerIdentityPublicKeyB64: peerIk,
+      rk:            rk,
+      dhS:           dhS,
+      cks:           cks,
+      ckr:           ckr,
+      peerRatchetPub: peerRatchetPub,
+    );
+    session._ns  = ns;
+    session._nr  = nr;
+    session._pns = pns;
+
+    // Restore skipped keys — throws on malformation (whole blob discarded).
+    session._skipped.restoreEntries(skipped);
+
+    return session;
+  }
 
   // ── Internal helpers ──────────────────────────────────────────────────────
 

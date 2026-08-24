@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -15,6 +17,7 @@ import '../services/crypto_service.dart';
 import '../services/database_service.dart';
 import '../services/identity_key_service.dart';
 import '../services/notification_service.dart';
+import '../services/outbox_service.dart';
 import '../services/sam_service.dart';
 import '../services/session_manager.dart';
 import '../services/x3dh_service.dart';
@@ -66,6 +69,11 @@ final messageRepositoryProvider = Provider<MessageRepository>((ref) {
     ref.watch(databaseServiceProvider),
     ref.watch(cryptoServiceProvider),
   );
+});
+
+/// Singleton [OutboxService] — durable queue for failed SAM transmissions.
+final outboxServiceProvider = Provider<OutboxService>((ref) {
+  return OutboxService();
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -294,6 +302,30 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// OUTBOX AUTO-RETRY — one pass per SAM reconnect
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Watches SAM status events; every time a live session comes up (initial
+/// connect or reconnect) each queued outbox entry is retried exactly once.
+final outboxRetryListenerProvider = Provider<void>((ref) {
+  ref.listen<AsyncValue<Map<String, dynamic>>>(
+    samStatusProvider,
+    (previous, next) {
+      final status = next.valueOrNull?['status'];
+      if (status != 'session_ok') return;
+
+      final outbox = ref.read(outboxServiceProvider);
+      final sam    = ref.read(samServiceProvider);
+      unawaited(
+        outbox.retryAll(
+          (entry) => sam.sendRawMessage(entry.destination, entry.encryptedPayload),
+        ),
+      );
+    },
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CONVERSATIONS PROVIDER — persisted to SQLite
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -473,6 +505,17 @@ class MessagesNotifier extends FamilyAsyncNotifier<List<Message>, String> {
     final repo = ref.read(messageRepositoryProvider);
     await repo.deleteAll(arg);
     state = const AsyncData([]);
+  }
+
+  /// Persists a status transition (sending → sent / failed → sent) and
+  /// mirrors it into the UI state.
+  Future<void> updateStatus(String messageId, MessageStatus status) async {
+    await ref.read(messageRepositoryProvider).updateStatus(messageId, status);
+    final current = state.valueOrNull ?? [];
+    state = AsyncData([
+      for (final m in current)
+        if (m.id == messageId) m.copyWith(status: status) else m,
+    ]);
   }
 
   // ── Mock seed ─────────────────────────────────────────────────────────────

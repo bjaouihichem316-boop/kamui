@@ -54,9 +54,15 @@ void main() {
       final decrypted = await bobSessionManager.decryptV4(convId, wirePayload);
       expect(decrypted, equals('Valid first message'));
 
-      // OPK 1 must now be consumed
+      // The OPK actually selected by the initiator (pool-aware) must now be
+      // consumed — replay/reuse of that exact OPK fails closed.
+      final envelope = HandshakeInitEnvelope.fromJson(jsonDecode(wirePayload));
+      final usedOpkId = envelope.opkIdUsed;
+      expect(usedOpkId, isNotNull);
+      expect(bobBundle.opks.containsKey(usedOpkId), isTrue,
+          reason: 'used OPK must come from the published pool');
       expect(
-        () => bobIdentity.getOpk(1),
+        () => bobIdentity.getOpk(usedOpkId!),
         throwsA(isA<X3dhException>()),
         reason: 'OPK must be consumed after successful authentication',
       );
@@ -164,21 +170,28 @@ void main() {
         );
       }
 
-      // Bob's OPK 1 is still available and untouched!
-      expect(bobIdentity.getOpk(1), isNotNull);
+      // Bob's entire OPK pool is still available and untouched!
+      for (final poolId in bobBundle!.opks.keys) {
+        expect(bobIdentity.getOpk(poolId), isNotNull,
+            reason: 'failed attacks must not consume pool OPK $poolId');
+      }
 
-      // Genuine Alice can now still successfully establish session using Bob's OPK 1
+      // Genuine Alice can now still successfully establish session using Bob's OPK pool
       final genuineWire = await aliceSessionManager.encryptV4(
         convId,
         'Genuine Alice message after 10 failed attacks',
-        peerPreKeyBundleJson: jsonEncode(bobBundle!.toJson()),
+        peerPreKeyBundleJson: jsonEncode(bobBundle.toJson()),
       );
 
       final genuineDecrypted = await bobSessionManager.decryptV4(convId, genuineWire);
       expect(genuineDecrypted, equals('Genuine Alice message after 10 failed attacks'));
 
-      // Only now is OPK 1 consumed
-      expect(() => bobIdentity.getOpk(1), throwsA(isA<X3dhException>()));
+      // Only now is the genuinely-used OPK consumed
+      final genuineEnvelope = HandshakeInitEnvelope.fromJson(jsonDecode(genuineWire));
+      expect(
+        () => bobIdentity.getOpk(genuineEnvelope.opkIdUsed!),
+        throwsA(isA<X3dhException>()),
+      );
     });
   });
 

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
@@ -35,6 +36,13 @@ class PreKeyBundle {
   /// X25519 One-Time PreKey (32 bytes). Optional — omitted when pool is exhausted.
   final List<int>? opkPub;
 
+  /// Full One-Time PreKey pool as `(id → public key)` pairs (Phase: OPK pool).
+  ///
+  /// Published in QR bundles so a single published bundle can satisfy multiple
+  /// offline handshakes. [opkId]/[opkPub] remain the backward-compatible mirror
+  /// of the currently-active OPK for older peers.
+  final Map<int, List<int>> opks;
+
   const PreKeyBundle({
     required this.ikPubEd,
     required this.ikPubDh,
@@ -42,6 +50,7 @@ class PreKeyBundle {
     required this.spkSig,
     this.opkId,
     this.opkPub,
+    this.opks = const {},
   });
 
   Map<String, dynamic> toJson() => {
@@ -51,9 +60,14 @@ class PreKeyBundle {
     'spk_sig': base64Encode(spkSig),
     if (opkId != null) 'opk_id': opkId,
     if (opkPub != null) 'opk': base64Encode(opkPub!),
+    if (opks.isNotEmpty)
+      'opks': {
+        for (final entry in opks.entries) entry.key.toString(): base64Encode(entry.value),
+      },
   };
 
   factory PreKeyBundle.fromJson(Map<String, dynamic> json) {
+    final rawOpks = json['opks'];
     return PreKeyBundle(
       ikPubEd: base64Decode(json['ik_ed']   as String),
       ikPubDh: base64Decode(json['ik_dh']   as String),
@@ -63,6 +77,12 @@ class PreKeyBundle {
       opkPub:  json['opk'] != null
                ? base64Decode(json['opk'] as String)
                : null,
+      opks: rawOpks is Map
+          ? {
+              for (final entry in rawOpks.entries)
+                int.parse(entry.key as String): base64Decode(entry.value as String),
+            }
+          : const {},
     );
   }
 }
@@ -231,13 +251,18 @@ class X3dhService {
   /// **Alice (Initiator)** performs the X3DH handshake against Bob's [bundleB].
   ///
   /// 1. Verify [bundleB].spkSig — throws [X3dhException] on failure (Fail-Closed).
-  /// 2. Validate OPK consistency (Four explicit states).
+  /// 2. Select an OPK (pool-aware):
+  ///    - Pool present → pick [preferredOpkId] if given and available, else a
+  ///      uniformly random entry. Enables multiple offline handshakes against
+  ///      ONE published bundle.
+  ///    - Pool absent → legacy single `opk`/`opk_id` four-state validation.
   /// 3. Generate ephemeral key EK_A.
-  /// 4. Compute DH1–DH3 (+ optional DH4 if OPK present).
+  /// 4. Compute DH1–DH3 (+ DH4 with the selected OPK when present).
   /// 5. Derive 32-byte SK via HKDF-SHA256.
   static Future<X3dhResult> initiatorHandshake({
     required SimpleKeyPair ikADh,    // Alice's X25519 DH identity key
     required PreKeyBundle  bundleB,  // Bob's PreKeyBundle
+    int? preferredOpkId,             // Deterministic pool selection (tests / advanced routing)
   }) async {
     // 1. Verify SPK signature — abort on MITM
     if (!await verifyPreKeyBundle(bundleB)) {
@@ -246,16 +271,45 @@ class X3dhService {
       );
     }
 
-    // 2. Validate OPK consistency (Four explicit states — Fail-Closed)
-    if (bundleB.opkPub != null && bundleB.opkId == null) {
-      throw const X3dhException(
-        'Malformed PreKeyBundle: opkPub present without explicit opkId',
-      );
-    }
-    if (bundleB.opkPub == null && bundleB.opkId != null) {
-      throw const X3dhException(
-        'Malformed PreKeyBundle: opkId present without opkPub',
-      );
+    // 2. OPK selection (pool-aware)
+    List<int>? selectedOpkPub;
+    int? usedOpkId;
+
+    if (bundleB.opks.isNotEmpty) {
+      // ── Pool path ────────────────────────────────────────────────────────
+      final ids = bundleB.opks.keys.toList()..sort();
+      int chosen;
+      if (preferredOpkId != null) {
+        if (!bundleB.opks.containsKey(preferredOpkId)) {
+          throw X3dhException(
+            'Requested one-time prekey (ID: $preferredOpkId) is not in the published pool.',
+          );
+        }
+        chosen = preferredOpkId;
+      } else {
+        chosen = ids[_secureRandom.nextInt(ids.length)];
+      }
+      selectedOpkPub = bundleB.opks[chosen];
+      usedOpkId      = chosen;
+      if (selectedOpkPub == null || selectedOpkPub.length != 32) {
+        throw const X3dhException(
+          'Malformed PreKeyBundle: pooled OPK public key is missing or not 32 bytes.',
+        );
+      }
+    } else {
+      // ── Legacy single-OPK path (four explicit states — Fail-Closed) ─────
+      if (bundleB.opkPub != null && bundleB.opkId == null) {
+        throw const X3dhException(
+          'Malformed PreKeyBundle: opkPub present without explicit opkId',
+        );
+      }
+      if (bundleB.opkPub == null && bundleB.opkId != null) {
+        throw const X3dhException(
+          'Malformed PreKeyBundle: opkId present without opkPub',
+        );
+      }
+      selectedOpkPub = bundleB.opkPub;
+      usedOpkId      = bundleB.opkId;
     }
 
     // 3. Generate fresh ephemeral key EK_A
@@ -276,11 +330,9 @@ class X3dhService {
 
     // DH4 = X25519(EK_A_priv, OPK_B_pub) — one-time FS [optional]
     List<int>? dh4;
-    int? usedOpkId;
-    if (bundleB.opkPub != null && bundleB.opkId != null) {
-      final opkBPub = SimplePublicKey(bundleB.opkPub!, type: KeyPairType.x25519);
+    if (selectedOpkPub != null && usedOpkId != null) {
+      final opkBPub = SimplePublicKey(selectedOpkPub, type: KeyPairType.x25519);
       dh4 = await _dh(ekA, opkBPub);
-      usedOpkId = bundleB.opkId;
     }
 
     // 6. Derive shared secret
@@ -292,6 +344,9 @@ class X3dhService {
       opkId:        usedOpkId,
     );
   }
+
+  /// Uniformly random source for pool OPK selection.
+  static final math.Random _secureRandom = math.Random.secure();
 
   /// **Bob (Responder)** mirrors Alice's DH operations to derive the identical SK.
   ///
