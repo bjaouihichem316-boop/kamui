@@ -2,6 +2,18 @@
 /// Single source of truth for configuration values.
 library;
 
+/// Inbound transport backend for receiving I2P messages.
+enum SamInboundMode {
+  /// Primary: bind a local ServerSocket and hand its port to the router via
+  /// `STREAM FORWARD`; each inbound I2P connection arrives as a loopback TCP
+  /// connection whose first line is `FROM <destination>`.
+  forward,
+
+  /// Fallback: repeatedly arm `STREAM ACCEPT ID=<session> SILENT=false` on
+  /// dedicated sockets; each accepted reply serves exactly one connection.
+  accept,
+}
+
 class KamuiConstants {
   KamuiConstants._();
 
@@ -15,6 +27,27 @@ class KamuiConstants {
   static const int    samPort         = 7656;
   static const String samMinVersion   = '3.0';
   static const String samMaxVersion   = '3.3';
+
+  // ─── Inbound Transport ────────────────────────────────────────
+  /// Inbound backend selection. FORWARD is primary; ACCEPT is the fallback
+  /// for routers without FORWARD support.
+  static const SamInboundMode samInboundMode = SamInboundMode.forward;
+
+  /// Local TCP port bound by the FORWARD listener for router hand-off.
+  static const int samForwardPort = 7657;
+
+  /// Host bound by the FORWARD listener (router connects over loopback only).
+  static const String samForwardHost = '127.0.0.1';
+
+  // ─── Reconnect Backoff ────────────────────────────────────────
+  /// First reconnect delay after unexpected control-socket loss.
+  static const Duration reconnectInitialBackoff = Duration(seconds: 2);
+
+  /// Hard cap for the exponential backoff sequence (2s → 4s → … → 60s).
+  static const Duration reconnectMaxBackoff = Duration(seconds: 60);
+
+  /// ±20% jitter applied to every backoff delay to avoid thundering herds.
+  static const double reconnectJitterRatio = 0.2;
 
   // ─── Timeouts ─────────────────────────────────────────────────
   static const Duration connectTimeout  = Duration(seconds: 5);

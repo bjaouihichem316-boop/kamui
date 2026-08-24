@@ -1,36 +1,60 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:io' show SocketException;
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
 import '../core/constants.dart';
+import 'sam_channel.dart';
 
 /// Singleton service implementing the I2P SAM v3.3 bridge protocol.
 ///
 /// Features:
 ///   • Centralized incoming line dispatcher ([_incomingLines])
 ///   • Live stream sockets for outbound and inbound messages
+///   • Inbound transport via SAM STREAM FORWARD (STREAM ACCEPT fallback)
+///   • Bounded-backoff automatic reconnect on control-socket loss
 ///   • Dynamic telemetry updates for active tunnels and bandwidth
 ///   • Real-time broadcast stream for incoming peer messages
 class SamService {
   // ─── Singleton ────────────────────────────────────────────────────────
   static final SamService _instance = SamService._internal();
   factory SamService() => _instance;
-  SamService._internal();
+
+  /// Isolated instance for tests — injects an in-memory [channelFactory].
+  factory SamService.isolated({SamChannelFactory? channelFactory}) =>
+      SamService._internal(channelFactory: channelFactory);
+
+  SamService._internal({SamChannelFactory? channelFactory})
+      : _channelFactory = channelFactory ?? const IoSamChannelFactory();
 
   // ─── Config ──────────────────────────────────────────────────────────
   String host = KamuiConstants.samHost;
   int    port = KamuiConstants.samPort;
 
+  /// Inbound transport backend (FORWARD primary, ACCEPT fallback).
+  SamInboundMode inboundMode = KamuiConstants.samInboundMode;
+
   // ─── State ───────────────────────────────────────────────────────────
-  Socket? _controlSocket;
+  final SamChannelFactory _channelFactory;
+  SamChannel? _controlSocket;
   String? sessionId;
   String? localDestinationKey;
 
   bool _isConnected      = false;
   bool _isSessionCreated = false;
+
+  // ─── Inbound listener state ──────────────────────────────────────────
+  SamServerChannel? _forwardServer;
+  int               _inboundGeneration = 0;
+
+  // ─── Reconnect state ─────────────────────────────────────────────────
+  bool _disposed       = false;
+  bool _hadLiveSession = false;
+  bool _isReconnecting = false;
+  final math.Random _jitterRandom = math.Random();
 
   bool get isConnected      => _isConnected;
   bool get isSessionCreated => _isSessionCreated;
@@ -77,7 +101,7 @@ class SamService {
     _emitStatus('connecting');
 
     try {
-      _controlSocket = await Socket.connect(
+      _controlSocket = await _channelFactory.connect(
         host,
         port,
         timeout: KamuiConstants.connectTimeout,
@@ -153,6 +177,11 @@ class SamService {
     }
 
     _emitStatus(result ? 'session_ok' : 'session_failed');
+
+    if (result) {
+      _hadLiveSession = true;
+      await _startInbound();
+    }
     return result;
   }
 
@@ -181,9 +210,9 @@ class SamService {
     _log('info',
         'Opening garlic tunnel to ${_truncateDest(targetDestination)}…');
 
-    Socket? sendSocket;
+    SamChannel? sendSocket;
     try {
-      sendSocket = await Socket.connect(
+      sendSocket = await _channelFactory.connect(
         host,
         port,
         timeout: KamuiConstants.connectTimeout,
@@ -192,7 +221,7 @@ class SamService {
       String sendBuffer = '';
       final completer = Completer<bool>();
 
-      sendSocket.listen(
+      sendSocket.dataStream.listen(
         (List<int> data) {
           sendBuffer += utf8.decode(data, allowMalformed: true);
           while (sendBuffer.contains('\n')) {
@@ -202,12 +231,12 @@ class SamService {
             if (line.isEmpty) continue;
 
             if (line.contains('HELLO REPLY') && line.contains('RESULT=OK')) {
-              sendSocket?.write(
+              sendSocket?.writeUtf8(
                 'STREAM CONNECT ID=$sessionId DESTINATION=$targetDestination\n',
               );
             } else if (line.contains('STREAM STATUS')) {
               if (line.contains('RESULT=OK')) {
-                sendSocket?.write('$message\n');
+                sendSocket?.writeUtf8('$message\n');
                 _log('success', 'Message delivered to SAM socket.');
                 if (!completer.isCompleted) completer.complete(true);
               } else {
@@ -231,7 +260,7 @@ class SamService {
         },
       );
 
-      sendSocket.write(
+      sendSocket.writeUtf8(
         'HELLO VERSION MIN=${KamuiConstants.samMinVersion} MAX=${KamuiConstants.samMaxVersion}\n',
       );
 
@@ -325,6 +354,9 @@ class SamService {
     _log('info', 'Rotating SAM Session for Persona: "$personaId"…');
 
     if (_isSessionCreated && sessionId != null) {
+      // Tear down the inbound listener before destroying the session it
+      // belongs to; createSession() re-arms it for the new persona session.
+      await _teardownInboundListener();
       _write('SESSION DESTROY ID=$sessionId');
       _isSessionCreated = false;
       sessionId = null;
@@ -341,7 +373,10 @@ class SamService {
 
   /// Disconnects and releases all resources.
   void dispose() {
+    _disposed       = true;
+    _isReconnecting = false;
     _telemetryTimer?.cancel();
+    unawaited(_teardownInboundListener());
     _controlSocket?.destroy();
     _controlSocket     = null;
     _isConnected       = false;
@@ -362,24 +397,20 @@ class SamService {
 
   void _attachSocketListener() {
     _buffer = '';
-    _controlSocket!.listen(
+    _controlSocket!.dataStream.listen(
       (List<int> data) {
         _buffer += utf8.decode(data, allowMalformed: true);
         _flushLines();
       },
       onError: (Object error) {
-        _log('error', 'Control socket error: $error');
-        _isConnected = false;
-        _emitStatus('disconnected');
+        _handleControlLoss('SAM control socket error: $error');
       },
       onDone: () {
         if (_buffer.trim().isNotEmpty) {
           _dispatchLine(_buffer.trim());
           _buffer = '';
         }
-        _log('info', 'SAM control socket closed by remote');
-        _isConnected = false;
-        _emitStatus('disconnected');
+        _handleControlLoss('SAM control socket closed by remote');
       },
       cancelOnError: false,
     );
@@ -424,6 +455,250 @@ class SamService {
     );
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // INTERNAL — Inbound Transport (SAM STREAM FORWARD / STREAM ACCEPT)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /// Starts (or restarts) the inbound listener for the active session.
+  ///
+  /// Idempotent: any previously armed listener is torn down first. Called
+  /// automatically on every successful [createSession].
+  Future<void> startInbound() => _startInbound();
+
+  Future<void> _startInbound() async {
+    await _teardownInboundListener();
+    if (_disposed || !_isSessionCreated || sessionId == null) return;
+    switch (inboundMode) {
+      case SamInboundMode.forward:
+        await _armForwardListener();
+      case SamInboundMode.accept:
+        // Fire-and-forget: the loop logs internally and exits on teardown
+        // (generation bump) or dispose; late faults are swallowed.
+        unawaited(
+          _runAcceptLoop(_inboundGeneration).catchError((Object e) {
+            _log('error', 'ACCEPT loop fault: $e');
+          }),
+        );
+    }
+  }
+
+  /// Closes the FORWARD server / stops the ACCEPT loop (generation bump).
+  Future<void> _teardownInboundListener() async {
+    _inboundGeneration++;
+    final SamServerChannel? server = _forwardServer;
+    _forwardServer = null;
+    if (server == null) return;
+    try {
+      await server.close();
+    } catch (e) {
+      _log('warning', 'Forward listener close failed: $e');
+    }
+  }
+
+  /// Arms SAM STREAM FORWARD: binds a local ServerSocket and hands its port
+  /// to the router, which connects inbound I2P streams onto it.
+  Future<void> _armForwardListener() async {
+    final String id = sessionId!;
+    try {
+      final SamServerChannel server = await _channelFactory.bind(
+        KamuiConstants.samForwardHost,
+        KamuiConstants.samForwardPort,
+      );
+      if (_disposed || sessionId != id) {
+        await server.close();
+        return;
+      }
+      _forwardServer = server;
+      server.connections.listen(_onRouterConnection);
+
+      _write(
+        'STREAM FORWARD ID=$id '
+        'PORT=${KamuiConstants.samForwardPort} '
+        'HOST=${KamuiConstants.samForwardHost} SILENT=false',
+      );
+      final ok = await _awaitForwardAck();
+      if (ok) {
+        _log('success',
+            'Inbound listener armed (FORWARD ${KamuiConstants.samForwardHost}:${KamuiConstants.samForwardPort})');
+      } else {
+        _log('error', 'STREAM FORWARD rejected — inbound receive offline');
+      }
+      _emitStatus(ok ? 'inbound_ok' : 'inbound_failed');
+    } catch (e) {
+      _log('error', 'Failed to arm FORWARD listener: $e');
+      _emitStatus('inbound_failed');
+    }
+  }
+
+  Future<bool> _awaitForwardAck() async {
+    final reply = await _awaitReply(
+      (line) => line.contains('DIRECTION') || line.contains('STREAM STATUS'),
+      timeout: KamuiConstants.sessionTimeout,
+    );
+    return reply != null && reply.contains('RESULT=OK');
+  }
+
+  /// Entry point for every router hand-off connection (FORWARD mode).
+  void _onRouterConnection(SamChannel connection) {
+    _InboundConnectionHandler.fromLine(this, connection);
+  }
+
+  /// Fallback backend: repeatedly arms `STREAM ACCEPT ID=<session>` on
+  /// dedicated sockets. Each armed socket serves exactly one inbound
+  /// connection; the loop then re-arms a fresh socket.
+  Future<void> _runAcceptLoop(int generation) async {
+    _log('info', 'Inbound ACCEPT loop starting…');
+    while (!_disposed &&
+        _inboundGeneration == generation &&
+        _isSessionCreated &&
+        sessionId != null) {
+      SamChannel? channel;
+      try {
+        channel = await _channelFactory.connect(
+          host,
+          port,
+          timeout: KamuiConstants.connectTimeout,
+        );
+        final armed = await _armAcceptSocket(channel);
+        if (!armed) {
+          channel.destroy();
+          await _acceptRetryPause();
+          continue;
+        }
+        final reader = _InboundConnectionHandler.statusGated(this, channel);
+        final ok = await reader.armed.timeout(
+          KamuiConstants.sessionTimeout,
+          onTimeout: () => false,
+        );
+        if (!ok) {
+          reader.abort('STREAM STATUS never confirmed OK');
+          await _acceptRetryPause();
+          continue;
+        }
+        _log('info', 'STREAM ACCEPT armed — waiting for inbound peer…');
+        await reader.done;
+        channel.destroy();
+        _log('info', 'Inbound connection consumed — re-arming ACCEPT');
+      } catch (e) {
+        channel?.destroy();
+        _log('error', 'ACCEPT loop error: $e');
+        await _acceptRetryPause();
+      }
+    }
+    _log('info', 'Inbound ACCEPT loop stopped');
+  }
+
+  /// HELLO + STREAM ACCEPT handshake on a dedicated accept socket.
+  /// The subsequent `STREAM STATUS` reply is consumed by the reader.
+  Future<bool> _armAcceptSocket(SamChannel channel) async {
+    channel.writeUtf8(
+      'HELLO VERSION MIN=${KamuiConstants.samMinVersion} '
+      'MAX=${KamuiConstants.samMaxVersion}\n',
+    );
+    final hello = await _awaitLineOn(
+      channel,
+      (line) => line.contains('HELLO REPLY'),
+      timeout: KamuiConstants.handshakeTimeout,
+    );
+    if (hello == null || !hello.contains('RESULT=OK')) return false;
+    channel.writeUtf8('STREAM ACCEPT ID=$sessionId SILENT=false\n');
+    return true;
+  }
+
+  Future<void> _acceptRetryPause() {
+    return Future<void>.delayed(const Duration(milliseconds: 500));
+  }
+
+  /// Waits for the first line on [channel] matching [matcher]. Unlike
+  /// [_awaitReply] this targets a dedicated (non-control) socket.
+  Future<String?> _awaitLineOn(
+    SamChannel channel,
+    bool Function(String line) matcher, {
+    Duration timeout = const Duration(seconds: 10),
+  }) {
+    final completer = Completer<String?>();
+    late final StreamSubscription<Uint8List> sub;
+    var buffer = '';
+
+    sub = channel.dataStream.listen((List<int> data) {
+      buffer += utf8.decode(data, allowMalformed: true);
+      while (buffer.contains('\n') && !completer.isCompleted) {
+        final idx  = buffer.indexOf('\n');
+        final line = buffer.substring(0, idx).trim();
+        buffer     = buffer.substring(idx + 1);
+        if (line.isNotEmpty && matcher(line)) {
+          completer.complete(line);
+          Future<void>(() => sub.cancel());
+        }
+      }
+    }, onError: (Object e) {
+      if (!completer.isCompleted) completer.complete(null);
+    }, onDone: () {
+      if (!completer.isCompleted) completer.complete(null);
+    });
+
+    return completer.future.timeout(timeout, onTimeout: () {
+      sub.cancel();
+      return null;
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // INTERNAL — Control-Socket Loss & Reconnect Backoff
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /// Handles unexpected control-socket death: marks state down and kicks the
+  /// bounded-backoff reconnect loop (retries forever until [dispose]).
+  void _handleControlLoss(String reason) {
+    _isConnected      = false;
+    _isSessionCreated = false;
+    _log('error', reason);
+    _emitStatus('disconnected');
+    _scheduleReconnect();
+  }
+
+  void _scheduleReconnect() {
+    if (_disposed || _isReconnecting || !_hadLiveSession) return;
+    _isReconnecting = true;
+    unawaited(_runReconnectLoop());
+  }
+
+  /// Exponential backoff 2s → 4s → … → 60s cap, ±20% jitter, infinite retries.
+  Future<void> _runReconnectLoop() async {
+    var delayMs = KamuiConstants.reconnectInitialBackoff.inMilliseconds;
+    final capMs = KamuiConstants.reconnectMaxBackoff.inMilliseconds;
+
+    while (!_disposed) {
+      _log('info', 'Reconnecting in ${_jitter(delayMs)}ms…');
+      _emitStatus('reconnecting');
+      await Future<void>.delayed(Duration(milliseconds: _jitter(delayMs)));
+      if (_disposed) break;
+
+      final recovered = await _attemptReconnect();
+      if (recovered) {
+        _log('success', 'SAM link restored — session "${sessionId ?? ""}"');
+        _isReconnecting = false;
+        return;
+      }
+      delayMs = math.min(delayMs * 2, capMs);
+    }
+    _isReconnecting = false;
+  }
+
+  Future<bool> _attemptReconnect() async {
+    final id = sessionId ?? 'KamuiSession';
+    final connected = await connectAndHandshake();
+    if (!connected || _disposed) return false;
+    return createSession(id);
+  }
+
+  /// Applies ±[KamuiConstants.reconnectJitterRatio] jitter to [ms].
+  int _jitter(int ms) {
+    const ratio = KamuiConstants.reconnectJitterRatio;
+    final factor = 1.0 - ratio + _jitterRandom.nextDouble() * 2 * ratio;
+    return (ms * factor).round();
+  }
+
   void _startTelemetry() {
     _telemetryTimer?.cancel();
     _telemetryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
@@ -440,7 +715,7 @@ class SamService {
 
   void _write(String cmd) {
     _log('data', '>>> $cmd');
-    _controlSocket?.write('$cmd\n');
+    _controlSocket?.writeUtf8('$cmd\n');
   }
 
   void _log(String type, String message) {
@@ -470,5 +745,129 @@ class SamService {
   String _truncateDest(String dest) {
     if (dest.length <= 12) return dest;
     return '${dest.substring(0, 6)}…${dest.substring(dest.length - 4)}';
+  }
+}
+
+/// Per-connection inbound frame parser.
+///
+/// Wire contract (SILENT=false): the first line MUST be
+/// `FROM <base64 destination>`; every subsequent newline-terminated line is
+/// one encrypted payload. Sender identity comes ONLY from the FROM line —
+/// it is never guessed from ciphertext. Connections violating the FROM
+/// contract are dropped and logged (fail-closed, no crash).
+class _InboundConnectionHandler {
+  static const int _phaseStatus  = 0;
+  static const int _phaseFrom    = 1;
+  static const int _phasePayload = 2;
+
+  final SamService _service;
+  final SamChannel _channel;
+  final Completer<void> _done  = Completer<void>();
+  final Completer<bool> _armed = Completer<bool>();
+
+  int     _phase;
+  String  _buffer     = '';
+  String? _senderDest;
+  StreamSubscription<Uint8List>? _sub;
+
+  _InboundConnectionHandler._(this._service, this._channel, bool statusGated)
+      : _phase = statusGated ? _phaseStatus : _phaseFrom {
+    _sub = _channel.dataStream.listen(
+      _onData,
+      onError: (Object e) => abort('Inbound stream error: $e'),
+      onDone: _finish,
+    );
+  }
+
+  /// Standard router hand-off (FORWARD): first line is `FROM <dest>`.
+  factory _InboundConnectionHandler.fromLine(
+          SamService service, SamChannel channel) =>
+      _InboundConnectionHandler._(service, channel, false);
+
+  /// ACCEPT socket: waits for `STREAM STATUS … RESULT=OK` before data mode.
+  factory _InboundConnectionHandler.statusGated(
+          SamService service, SamChannel channel) =>
+      _InboundConnectionHandler._(service, channel, true);
+
+  /// Completes `true` once the ACCEPT socket is armed (status-gated mode);
+  /// completes immediately for FROM-gated mode.
+  Future<bool> get armed =>
+      _phase == _phaseStatus ? _armed.future : Future<bool>.value(true);
+
+  /// Completes when the connection finishes (closed, aborted, or consumed).
+  Future<void> get done => _done.future;
+
+  void _onData(Uint8List data) {
+    _buffer += utf8.decode(data, allowMalformed: true);
+    while (_buffer.contains('\n')) {
+      final idx  = _buffer.indexOf('\n');
+      final line = _buffer.substring(0, idx).trim();
+      _buffer    = _buffer.substring(idx + 1);
+      if (line.isNotEmpty) _onLine(line);
+    }
+  }
+
+  void _onLine(String line) {
+    switch (_phase) {
+      case _phaseStatus:
+        final ok =
+            line.contains('STREAM STATUS') && line.contains('RESULT=OK');
+        if (!_armed.isCompleted) _armed.complete(ok);
+        if (!ok) abort('STREAM ACCEPT rejected ($line)');
+        _phase = _phaseFrom;
+      case _phaseFrom:
+        final dest = parseFromLine(line);
+        if (dest == null) {
+          abort('Inbound connection rejected — missing/invalid FROM line');
+          return;
+        }
+        _senderDest = dest;
+        _phase      = _phasePayload;
+        _service._log('info',
+            'Inbound stream opened <- ${_service._truncateDest(dest)}');
+      case _phasePayload:
+        _service.handleIncomingPayload(_senderDest!, line);
+    }
+  }
+
+  void _finish() {
+    if (_phase == _phaseStatus && !_armed.isCompleted) {
+      _armed.complete(false);
+    }
+    if (_phase == _phaseFrom) {
+      abort('Inbound connection closed before FROM line — dropped');
+      return;
+    }
+    // Tolerant flush: sender omitted the trailing newline on the last payload.
+    final tail = _buffer.trim();
+    if (_phase == _phasePayload && tail.isNotEmpty) {
+      _buffer = '';
+      _service.handleIncomingPayload(_senderDest!, tail);
+    }
+    _complete();
+  }
+
+  /// Drops the connection with a warning. Safe to call multiple times.
+  void abort(String reason) {
+    _service._log('warning', reason);
+    if (_armed.isCompleted == false) _armed.complete(false);
+    _complete();
+  }
+
+  void _complete() {
+    if (_done.isCompleted) return;
+    unawaited(_sub?.cancel());
+    _sub = null;
+    _channel.destroy();
+    _done.complete();
+  }
+
+  /// Parses `FROM <destination>`; returns the destination or `null`.
+  static String? parseFromLine(String line) {
+    if (!line.startsWith('FROM ')) return null;
+    final dest = line.substring(5).trim();
+    if (dest.isEmpty) return null;
+    if (!RegExp(r'^[A-Za-z0-9+~/=-]+$').hasMatch(dest)) return null;
+    return dest;
   }
 }

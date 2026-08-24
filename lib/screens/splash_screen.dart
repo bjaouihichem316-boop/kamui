@@ -68,6 +68,11 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
       if (!mounted) return;
 
       if (sessionOk) {
+        // createSession() already armed the inbound listener; this explicit
+        // re-arm is idempotent and keeps boot status honest.
+        _updateStatus('Arming Inbound Garlic Listener…');
+        await sam.startInbound();
+        if (!mounted) return;
         _updateStatus('Garlic Destination Acquired • Active');
       } else {
         _updateStatus('Handshake OK • Session Standby Mode');

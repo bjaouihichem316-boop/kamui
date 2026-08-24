@@ -185,7 +185,56 @@ When a **Duress PIN** is entered, Kamui performs a **defense-in-depth local stor
 
 ---
 
-## 6. Conformance & Verification Matrix
+## 6. Inbound Transport (SAM v3.3 Wire Termination)
+
+Outbound delivery uses per-message sockets (`HELLO` → `STREAM CONNECT` → write → destroy). Inbound reception is a persistent listener armed immediately after `SESSION CREATE` succeeds, implemented in `lib/services/sam_service.dart` and exercised by `test/sam_inbound_test.dart`.
+
+### 6.1 Mode Selection
+
+| Mode | Constant | Mechanism |
+| :--- | :--- | :--- |
+| **FORWARD** (primary) | `SamInboundMode.forward` (`KamuiConstants.samInboundMode`) | Kamui binds a local `ServerSocket` on `127.0.0.1:7657` and hands the port to the router via `STREAM FORWARD`. Each inbound I2P connection is delivered as a loopback TCP connection. |
+| **ACCEPT** (fallback) | `SamInboundMode.accept` | For routers without FORWARD support: repeated `STREAM ACCEPT ID=<session> SILENT=false` on dedicated sockets; each accepted socket serves exactly one connection, then a fresh socket is armed. |
+
+### 6.2 FORWARD Handshake Sequence
+
+```
+Kamui → SAM : STREAM FORWARD ID=<session> PORT=7657 HOST=127.0.0.1 SILENT=false
+SAM  → Kamui: DIRECTION RESULT=OK        (or STREAM STATUS RESULT=OK)
+Router      : opens loopback TCP connection to 127.0.0.1:7657 per inbound peer
+```
+
+### 6.3 FROM-Line Framing (SILENT=false)
+
+With `SILENT=false`, the first line of every inbound connection is the sender announcement:
+
+```
+FROM <base64 I2P destination>\n<encrypted payload line>\n
+```
+
+Rules (fail-closed):
+
+1. **Sender identity comes ONLY from the `FROM` line** — it is never inferred or guessed from ciphertext.
+2. The first line MUST match `FROM <destination>` where `<destination>` is non-empty base64-variant text (`[A-Za-z0-9+~/=-]+`). Any other first line ⇒ the connection is dropped and logged; no crash.
+3. Payload framing is newline-delimited: each subsequent non-empty line is one encrypted payload dispatched to `handleIncomingPayload(senderDestination, payload)`. v4 wire frames are base64 segments and JSON envelopes contain no raw newlines, so this is unambiguous.
+4. Partial TCP reads are handled by a per-connection line-buffer accumulator; a final payload missing its trailing `\n` is flushed tolerantly when the peer closes.
+5. A connection closed before any `FROM` line is dropped and logged.
+
+### 6.4 ACCEPT Fallback Loop
+
+Each iteration: open dedicated socket → `HELLO VERSION` → `STREAM ACCEPT ID=<session> SILENT=false` → await `STREAM STATUS RESULT=OK` → serve exactly one connection (same FROM-line contract as §6.3) → destroy socket → re-arm. Failures pause 500 ms before re-arming.
+
+### 6.5 Reconnect Policy
+
+On unexpected control-socket loss (error or remote close) while a session was live:
+
+- Status `reconnecting` is emitted on `statusStream`.
+- Retry loop: `HELLO` → `SESSION CREATE` → listener re-arm, with exponential backoff **2 s → 4 s → … → 60 s cap**, each delay jittered **±20%**.
+- The loop never gives up while the service is alive; `dispose()` cancels it permanently.
+
+---
+
+## 7. Conformance & Verification Matrix
 
 | Requirement | Implementation Component | Status | Verification Criteria |
 | :--- | :--- | :---: | :--- |
@@ -196,4 +245,7 @@ When a **Duress PIN** is entered, Kamui performs a **defense-in-depth local stor
 | **Double Ratchet Engine** | `DoubleRatchetSession` & `SessionManager` | ✅ Implemented (Live) | DH ratchet + symmetric KDF + candidate state rollback |
 | **Skipped Key Store (Anti-DoS)** | `SkippedKeyStore` | ✅ Implemented (Live) | Peek ➔ Authenticate ➔ Consume pattern with max skip bound |
 | **Prekey Bundle QR Handshake** | `IdentityKeyService` & `QrShareDialog` | ✅ Implemented (Live) | Embeds full v3 PreKeyBundle in QR payload |
+| **Inbound Transport (FORWARD)** | `SamService._armForwardListener` & `_InboundConnectionHandler` | ✅ Implemented (Live) | FROM-line sender routing, newline framing, invalid-FROM drop; `test/sam_inbound_test.dart` |
+| **Inbound Transport (ACCEPT fallback)** | `SamService._runAcceptLoop` | ✅ Implemented (Live) | One connection per armed socket, re-arm loop passes same inbound suite |
+| **Reconnect Backoff** | `SamService._runReconnectLoop` | ✅ Implemented (Live) | 2s→60s cap ×2, ±20% jitter, fake-async verified retry sequence |
 | **Duress Wipe (Defense-in-Depth)** | DB + `flutter_secure_storage` erase | ✅ Implemented | Local storage & key wipe on duress PIN |

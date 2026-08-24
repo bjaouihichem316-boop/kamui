@@ -75,8 +75,9 @@ This table provides full transparency on what is currently implemented in the co
 | **Prekey Bundle Infrastructure & QR Handshake** | ✅ Implemented (Live) | `lib/services/identity_key_service.dart` & `lib/widgets/qr_share_dialog.dart` — v3 PreKeyBundle payload |
 | **Out-of-Order Skipped Keys Caching (Anti-DoS)** | ✅ Implemented (Live) | `lib/services/double_ratchet.dart` — Peek ➔ Authenticate ➔ Consume pattern with TTL & max skip bounds |
 | **Fail-Closed E2EE Encryption (no silent downgrade)** | ✅ Implemented (Live) | `SessionManager.encryptV4()` & `chat_room_screen.dart` — Throws `SessionUnavailableException` on failure |
-| **Live v4 Wire Transport & Decryption** | ✅ Implemented (Live) | **Outbound-only** — `kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>` with live stream decryption in `providers.dart`. Inbound v4 transport still in progress. |
-| **I2P SAM v3.3 STREAM Transport** | ✅ Implemented | `lib/services/sam_service.dart` — TCP socket to `127.0.0.1:7656` |
+| **Live v4 Wire Transport & Decryption** | ✅ Implemented (Live) | **Bidirectional** — `kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>` streamed outbound via SAM STREAM CONNECT and received live via the inbound listener, with stream decryption in `providers.dart`. |
+| **Inbound Transport (live receive)** | ✅ Implemented (Live) | `lib/services/sam_service.dart` — SAM STREAM FORWARD on `127.0.0.1:7657` (`SILENT=false`, sender routed from `FROM` line), STREAM ACCEPT fallback mode, newline-delimited payload framing, exponential reconnect backoff (2s → 60s cap, ±20% jitter). |
+| **I2P SAM v3.3 STREAM Transport** | ✅ Implemented | `lib/services/sam_service.dart` — TCP socket to `127.0.0.1:7656`; socket layer abstracted behind `sam_channel.dart` for test injection |
 | **OS Notification Metadata Isolation** | ✅ Implemented | `lib/services/notification_service.dart` — generic title/body only |
 | **Self-Destruct TTL Messages** | ✅ Implemented | `lib/models/message.dart` — configurable expiry + DB purge |
 | **Duress PIN → Defense-in-depth local storage & key wipe** | ✅ Implemented | DB + secure storage wipe on duress PIN entry |
