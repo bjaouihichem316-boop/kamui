@@ -72,17 +72,21 @@ This table provides full transparency on what is currently implemented in the co
 | **X25519 & Ed25519 Identity Keyset** (`IdentityKeyService`) | ✅ Implemented | `lib/services/identity_key_service.dart` — stored in `flutter_secure_storage` (IK_ed, IK_dh, SPK, OPK) |
 | **Full X3DH Key Agreement (DH1–DH4 + HKDF-SHA256)** | ✅ Implemented (Live) | `lib/services/x3dh_service.dart` — Mutual auth with Ed25519 SPK verification & forward secrecy |
 | **Identity Binding & Transactional OPK Consumption** | ✅ Implemented (Live) | `lib/services/x3dh_service.dart` & `lib/services/session_manager.dart` — mandatory Ed25519 `ik_sig` binding IK_ed↔IK_dh in `HandshakeInitEnvelope` (fail-closed verification), OPK consumed only after first-message AEAD validation on a candidate session (anti-OPK-exhaustion DoS), four-state OPK consistency validation. Verified by `test/security_findings_v4_test.dart` |
+| **OPK Pool (8 one-time prekeys per bundle)** | ✅ Implemented (Live) | `lib/services/identity_key_service.dart` (`kOpkPoolSize = 8`) — full `(id → pub)` pool embedded in every QR bundle so one exchange satisfies multiple offline handshakes; consumed IDs persisted for replay rejection; pool replenished back to 8 after each consumption |
 | **Double Ratchet Engine (DH + Symmetric Ratchet)** | ✅ Implemented (Live) | `lib/services/double_ratchet.dart` — Transactional candidate state & rollback on MAC failure |
 | **Prekey Bundle Infrastructure & QR Handshake** | ✅ Implemented (Live) | `lib/services/identity_key_service.dart` & `lib/widgets/qr_share_dialog.dart` — v3 PreKeyBundle payload |
 | **Out-of-Order Skipped Keys Caching (Anti-DoS)** | ✅ Implemented (Live) | `lib/services/double_ratchet.dart` — Peek ➔ Authenticate ➔ Consume pattern with TTL & max skip bounds |
 | **Fail-Closed E2EE Encryption (no silent downgrade)** | ✅ Implemented (Live) | `SessionManager.encryptV4()` & `chat_room_screen.dart` — Throws `SessionUnavailableException` on failure |
+| **Ratchet Session Persistence Across Restarts** | ✅ Implemented (Live) | `lib/services/session_store.dart` & `double_ratchet.dart` — version-1 JSON state serialized only at transactional commit points, AES-256-GCM encrypted at rest in SQLite (`sessions` table); corrupt blobs discarded → fresh X3DH. Verified by `test/phase2_persistence_test.dart` |
+| **Send Outbox with Retry** | ✅ Implemented (Live) | `lib/services/outbox_service.dart` — failed SAM transmissions queued AES-GCM-encrypted in SQLite; one retry pass per SAM reconnect (`providers.dart`) + manual long-press retry; at-most-once semantics (stale ciphertext rejected fail-closed by peer ratchet). Verified by `test/outbox_test.dart` |
+| **No Fabricated Telemetry / Analytics** | ✅ Implemented | Zero analytics SDKs, no network calls beyond the local SAM bridge (`127.0.0.1:7656/7657`); logging is a structured local-only app logger (`lib/core/app_logger.dart`) with zero silent catches |
 | **Live v4 Wire Transport & Decryption** | ✅ Implemented (Live) | **Bidirectional** — `kamui_v4:<headerB64>:<nonceB64>:<ciphertextB64>` streamed outbound via SAM STREAM CONNECT and received live via the inbound listener, with stream decryption in `providers.dart`. |
 | **Inbound Transport (live receive)** | ✅ Implemented (Live) | `lib/services/sam_service.dart` — SAM STREAM FORWARD on `127.0.0.1:7657` (`SILENT=false`, sender routed from `FROM` line), STREAM ACCEPT fallback mode, newline-delimited payload framing, exponential reconnect backoff (2s → 60s cap, ±20% jitter). |
 | **I2P SAM v3.3 STREAM Transport** | ✅ Implemented | `lib/services/sam_service.dart` — TCP socket to `127.0.0.1:7656`; socket layer abstracted behind `sam_channel.dart` for test injection |
 | **OS Notification Metadata Isolation** | ✅ Implemented | `lib/services/notification_service.dart` — generic title/body only |
 | **Self-Destruct TTL Messages** | ✅ Implemented | `lib/models/message.dart` — configurable expiry + DB purge |
 | **Duress PIN → Defense-in-depth local storage & key wipe** | ✅ Implemented | DB + secure storage wipe on duress PIN entry |
-| **Biometric / PIN Lock Gate** | ✅ Implemented | Platform local auth on app resume — **not yet enforced at startup** |
+| **Biometric / PIN Lock Gate (startup + backgrounding)** | ✅ Implemented | `lib/services/lock_service.dart` — PBKDF2-hashed user-chosen PINs (200k rounds; legacy plaintext entries transparently upgraded). Enforced at startup (`splash_screen.dart` routes through the lock screen) and on background auto-lock (`main.dart` lifecycle observer); duress PIN triggers wipe before the decoy feed. Verified by `test/lock_service_test.dart` |
 
 > **Legend**: ✅ Implemented = verifiable in current `main` branch source code. All v4 (X3DH + Double Ratchet) components are active and live.
 
@@ -133,6 +137,42 @@ This table provides full transparency on what is currently implemented in the co
    ```bash
    flutter run
    ```
+
+### Release Signing (Android)
+
+Release builds are signed from `android/key.properties` (git-ignored). Without it, release builds fall back to **debug keys** with a build warning — fine for local development, never for distribution.
+
+1. **Generate a keystore** (do this once; keep it safe and back it up — losing it means you cannot update your published app):
+
+   ```bash
+   keytool -genkey -v -keystore ~/upload-keystore.jks \
+     -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+   ```
+
+2. **Create `android/key.properties`** (copy `android/key.properties.example` and fill in real values):
+
+   ```properties
+   storeFile=/absolute/path/to/upload-keystore.jks
+   storePassword=<your-store-password>
+   keyAlias=upload
+   keyPassword=<your-key-password>
+   ```
+
+3. **Build**:
+
+   ```bash
+   flutter build apk --release
+   ```
+
+> ⚠️ Never commit `android/key.properties`, `*.jks`, or `*.keystore` files — all three patterns are covered by `.gitignore`.
+
+---
+
+## 📱 Platform Notes
+
+- **iOS**: `Info.plist` declares honest usage strings for `NSCameraUsageDescription` (QR peer key exchange only) and `NSFaceIDUsageDescription` (local unlock only).
+- **Keychain accessibility**: Kamui's `flutter_secure_storage` entries use iOS accessibility `first_unlock` (`kSecAttrAccessibleAfterFirstUnlock`) so background SAM delivery works after the first device unlock. Keys are additionally protected by the hardware Keychain/Keystore.
+- **Android**: Secure storage uses EncryptedSharedPreferences; PINs are PBKDF2-hashed on top of that.
 
 ---
 

@@ -26,6 +26,10 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Kamui scans peer QR codes to exchange encryption keys. The camera is used only while adding a contact.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Kamui uses Face ID to unlock your local messages. Biometric data never leaves your device and is not accessible to Kamui.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

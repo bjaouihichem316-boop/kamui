@@ -112,6 +112,16 @@ This removes ambiguity (and the former implicit `opkId ?? 1` fallback): an OPK c
 
 On the wire, `ik_sig` is a required base64 field (64 bytes) in the `HandshakeInitEnvelope` JSON, alongside `ik_ed`, `ik_dh`, `ek`, optional `opk_id_used`, and `first_message`. Peers running versions **without** `ik_sig` support fail handshakes closed against `ik_sig`-enforcing peers (envelope missing/invalid `ik_sig` ⇒ rejection). This mixed-version incompatibility is intentional and points in the **safe direction**: version skew degrades to *"no communication"*, never to *"unauthenticated communication"*.
 
+### 2.7 One-Time Prekey Pool Semantics
+
+Each node maintains a pool of $n = 8$ live one-time prekeys (`kOpkPoolSize`, `lib/services/identity_key_service.dart`) instead of a single OPK:
+
+- **Bundle publication**: every published PreKeyBundle embeds the *full* `(id → pub)` map under an `opks` field (plus a legacy single-OPK mirror pointing at one live key for pre-pool peers). One QR exchange therefore satisfies multiple offline handshakes without re-scanning.
+- **Initiator selection**: when the bundle carries a pool, the initiator picks one `(id, opk_pub)` pair **uniformly at random** and runs 4-DH ($DH_4$) against it, recording the chosen id as `opk_id_used`.
+- **Responder replay protection**: `IdentityKeyService.getOpk(id)` fails closed — a consumed or unknown id raises `X3dhException` immediately (replay/reuse detected). Consumption itself is transactional per §2.4.
+- **Replenishment**: after each consumption the pool is topped back up to $n$ with freshly generated X25519 keys using **monotonically incremented ids** (ids are never reused).
+- **Persistence**: the live/consumed id registry is persisted to secure storage, so replay protection for consumed ids survives app restarts.
+
 ---
 
 ## 3. Ratchet Engine (Double Ratchet System)
@@ -159,6 +169,38 @@ DH_{out} &= \text{X25519}(DH_{our\_priv}, DH_{their\_new\_pub}) \\
 - **Security Constraint**: Skipped keys are bound by:
   - Max capacity per conversation: $1000$ keys.
   - Time-To-Live (TTL): $7$ days, after which unconsumed skipped keys are zeroized.
+
+### 3.3 Ratchet Session Persistence Format
+
+Sessions survive app restarts. Serialization is implemented in `DoubleRatchetSession.toPersistentJson()` / `fromPersistentJson()` (`lib/services/double_ratchet.dart`) and exercised by `test/phase2_persistence_test.dart`.
+
+**Format version 1** (`kPersistentStateVersion = 1`) — a JSON object:
+
+```json
+{
+  "version":          1,
+  "conversation_id":  "conv_...",
+  "peer_ik":          "<base64 peer X25519 identity DH key>",
+  "rk":               "<base64 root key>",
+  "cks":              "<base64 sending chain key>",      // optional (absent pre-first-send)
+  "ckr":              "<base64 receiving chain key>",    // optional (absent pre-first-receive)
+  "dh_s_priv":        "<base64 local ratchet private>",
+  "dh_s_pub":         "<base64 local ratchet public>",
+  "peer_ratchet_pub": "<base64 peer ratchet public>",   // optional
+  "ns":               0,
+  "nr":               0,
+  "pns":              0,
+  "skipped":          [ { "dh": "<base64 ratchet pub>", "n": 0,
+                          "key": "<base64 message key>", "created_ms": 1723465190000 } ]
+}
+```
+
+Rules:
+
+1. **Serialize only at transactional commit points** — after outbound encryption, after authenticated decryption, or at session creation. Candidate state is never persisted, preserving the rollback guarantees of §2.4.
+2. **Encrypted at rest**: the JSON blob is AES-256-GCM encrypted with the local `CryptoService` key *before* insertion into the SQLite `sessions` table (keyed by `conversation_id`). Plaintext ratchet state never touches disk.
+3. **All-or-nothing restore**: `fromPersistentJson()` throws on any malformation (wrong version, bad base64, wrong key lengths, missing fields). Callers treat the entire blob as corrupt, delete it, and fall back to a fresh X3DH handshake. A half-valid session is never returned.
+4. **Version gating**: blobs with an unsupported `version` are rejected outright; future format changes must bump `kPersistentStateVersion`.
 
 ---
 
@@ -279,6 +321,8 @@ On unexpected control-socket loss (error or remote close) while a session was li
 | **Fail-Closed Encryption** | `SessionManager.encryptV4()` & `encryptMessage()` | ✅ Implemented (Live) | Throws `SessionUnavailableException`; no silent downgrade |
 | **Full X3DH Key Agreement** | `X3dhService` & `SessionManager` | ✅ Implemented (Live) | Authenticated 3-DH / 4-DH with Ed25519 SPK verification |
 | **Identity Binding & Transactional OPK Consumption** | `X3dhService.verifyIdentityBinding` & `SessionManager` responder path | ✅ Implemented (Live) | Mandatory fail-closed `ik_sig` (domain `'Kamui-X3DH-Identity-Binding-v1'`); OPK consumed only after candidate-session AEAD validation; four-state OPK validation; `test/security_findings_v4_test.dart` |
+| **OPK Pool Semantics (§2.7)** | `IdentityKeyService` (`kOpkPoolSize = 8`) | ✅ Implemented (Live) | Full `(id → pub)` pool in every bundle, uniform-random initiator selection, consumed-id replay rejection persisted across restarts, replenish-to-8 with monotonic ids |
+| **Ratchet Session Persistence (§3.3)** | `SqliteSessionStore` & `DoubleRatchetSession.toPersistentJson` | ✅ Implemented (Live) | Version-1 JSON, AES-256-GCM encrypted at rest (SQLite `sessions`), serialize-only-at-commit, corrupt blob ⇒ discard + fresh X3DH; `test/phase2_persistence_test.dart` |
 | **Double Ratchet Engine** | `DoubleRatchetSession` & `SessionManager` | ✅ Implemented (Live) | DH ratchet + symmetric KDF + candidate state rollback |
 | **Skipped Key Store (Anti-DoS)** | `SkippedKeyStore` | ✅ Implemented (Live) | Peek ➔ Authenticate ➔ Consume pattern with max skip bound |
 | **Prekey Bundle QR Handshake** | `IdentityKeyService` & `QrShareDialog` | ✅ Implemented (Live) | Embeds full v3 PreKeyBundle in QR payload |

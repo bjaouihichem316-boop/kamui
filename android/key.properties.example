@@ -1,0 +1,16 @@
+# Kamui release signing configuration (template).
+#
+# Copy this file to android/key.properties and fill in real values.
+# android/key.properties is git-ignored; never commit the real file or keystore.
+#
+# Keystore generation (see README "Release" section):
+#   keytool -genkey -v -keystore ~/upload-keystore.jks -keyalg RSA \
+#     -keysize 2048 -validity 10000 -alias upload
+#
+# storeFile may be an absolute path, or a path relative to android/app/
+# (e.g. ../upload-keystore.jks for a keystore placed in the project root).
+
+storeFile=/absolute/path/to/upload-keystore.jks
+storePassword=__REPLACE_WITH_STORE_PASSWORD__
+keyAlias=upload
+keyPassword=__REPLACE_WITH_KEY_PASSWORD__
