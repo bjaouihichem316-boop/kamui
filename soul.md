@@ -28,7 +28,7 @@ Kamui is an untouchable, serverless communication layer built on top of the I2P 
 
 The following are vision items. They are **not implemented** in the current codebase and must not be presented as working features:
 
-- **Embedded i2pd router**: bundling the router inside the app so Kamui works without an external daemon. Today an external router is required.
+- **Embedded i2pd router**: bundling the router inside the app so Kamui works without an external daemon. Today an external router is required. Feasibility verdicts (researched 2026-08, see KAMUI_PROTOCOL_SPEC.md §8): Desktop — go first (bundle static binary ~3.5–4 MB as sidecar process); Android — go second (libi2pd.so via NDK, ~5–8 MB per ABI); iOS — defer (background suspension blocks inbound reception; foreground-only at best).
 - **Zero-Knowledge Monetization**: offline cryptographic verification via Monero / Lightning payments. Not started; no payment code exists in the repository.
 
 When a roadmap item ships, it graduates into §2/§3 with tests and documentation — never before.

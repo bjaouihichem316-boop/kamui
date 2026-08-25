@@ -88,6 +88,7 @@ This table provides full transparency on what is currently implemented in the co
 | **Self-Destruct TTL Messages** | ✅ Implemented | `lib/models/message.dart` — configurable expiry + DB purge |
 | **Duress PIN → Defense-in-depth local storage & key wipe** | ✅ Implemented | DB + secure storage wipe on duress PIN entry |
 | **Biometric / PIN Lock Gate (startup + backgrounding)** | ✅ Implemented | `lib/services/lock_service.dart` — PBKDF2-hashed user-chosen PINs (200k rounds; legacy plaintext entries transparently upgraded). Enforced at startup (`splash_screen.dart` routes through the lock screen) and on background auto-lock (`main.dart` lifecycle observer); duress PIN triggers wipe before the decoy feed. Verified by `test/lock_service_test.dart` |
+| **Embedded i2pd router** | ❌ **Roadmap** | External i2pd router required — feasibility research in [KAMUI_PROTOCOL_SPEC.md §8](KAMUI_PROTOCOL_SPEC.md#8-embedded-i2pd-router--feasibility-researched-2026-08) |
 
 > **Legend**: ✅ Implemented = verifiable in current `main` branch source code. All v4 (X3DH + Double Ratchet) components are active and live.
 
@@ -95,13 +96,7 @@ This table provides full transparency on what is currently implemented in the co
 
 ## 📸 Screenshots
 
-| Splash Launch | Cyberpunk Chat List | E2E Chat Room |
-| :---: | :---: | :---: |
-| *(Add Screenshot)* | *(Add Screenshot)* | *(Add Screenshot)* |
-
-| Node Settings & QR | Biometric Shield Gate | Decoy Duress Feed |
-| :---: | :---: | :---: |
-| *(Add Screenshot)* | *(Add Screenshot)* | *(Add Screenshot)* |
+> 📷 **TODO**: Real screenshots pending — capturing them requires a device/emulator run (with an i2pd router at `127.0.0.1:7656`). Tracked in [#1](https://github.com/bjaouihichem316-boop/kamui/issues/1), which lists the six needed screens. Fabricated images are intentionally not used.
 
 ---
 

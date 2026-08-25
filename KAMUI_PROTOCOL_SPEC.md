@@ -310,6 +310,8 @@ On unexpected control-socket loss (error or remote close) while a session was li
 - Retry loop: `HELLO` → `SESSION CREATE` → listener re-arm, with exponential backoff **2 s → 4 s → … → 60 s cap**, each delay jittered **±20%**.
 - The loop never gives up while the service is alive; `dispose()` cancels it permanently.
 
+Cold starts are covered too: when the startup reachability probe (`SamService.probeReachability`, 1 s budget) finds nothing listening on the SAM port, the splash flow explicitly arms the same backoff loop via `SamService.startReconnectLoop()` and routes to router-setup onboarding instead of faking a local node. A router launched minutes after the app is therefore picked up automatically; without that explicit arming, a failed cold start does not retry (the mid-session gate stays intact).
+
 ---
 
 ## 7. Conformance & Verification Matrix
@@ -330,3 +332,24 @@ On unexpected control-socket loss (error or remote close) while a session was li
 | **Inbound Transport (ACCEPT fallback)** | `SamService._runAcceptLoop` | ✅ Implemented (Live) | One connection per armed socket, re-arm loop passes same inbound suite |
 | **Reconnect Backoff** | `SamService._runReconnectLoop` | ✅ Implemented (Live) | 2s→60s cap ×2, ±20% jitter, fake-async verified retry sequence |
 | **Duress Wipe (Defense-in-Depth)** | DB + `flutter_secure_storage` erase | ✅ Implemented | Local storage & key wipe on duress PIN |
+
+---
+
+## 8. Embedded i2pd Router — Feasibility (researched 2026-08)
+
+Kamui today **requires an external router**; nothing in this section is shipped. This records the researched feasibility of bundling i2pd so the external-router requirement can eventually disappear.
+
+| Platform | Approach | Effort | Size cost | Verdict |
+|----------|----------|--------|-----------|---------|
+| Desktop | Bundle official static binary (~3.5–4 MB), spawn sidecar process, poll :7656 | S–M | ~3.5–4 MB/platform | Go first |
+| Android | libi2pd.so via NDK (PurpleI2P/i2pd-android toolchain, active v2.60.0), JNI/FFI bridge | M–L | ~5–8 MB per ABI | Go second |
+| iOS | libi2pd linked via documented toolchain; background suspension makes inbound reception impossible while backgrounded | L–XL | ~5–8 MB | Defer; foreground-only |
+
+Notes:
+
+- Configure an embedded router client-only: `transittunnels=0` and bandwidth caps, so it never carries transit traffic for strangers.
+- `SamService` needs zero protocol changes once a router listens on loopback SAM (`127.0.0.1:7656`) — embedding is purely a packaging/transport problem.
+- Rejected alternatives (documented unsupported):
+  - pub.dev `i2p` package — still requires an external router; adds no embedding capability.
+  - geograms/i2p-dart — pure-Dart node is pre-production and offers no streaming sessions; unusable for SAM v3 STREAM transport.
+  - Remote/community routers — unauthenticated SAM exposure plus metadata leakage to the router operator; contrary to the threat model.
