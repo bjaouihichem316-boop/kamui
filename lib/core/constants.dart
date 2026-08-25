@@ -50,6 +50,9 @@ class KamuiConstants {
   static const double reconnectJitterRatio = 0.2;
 
   // ─── Timeouts ─────────────────────────────────────────────────
+  /// Fast startup reachability probe budget (before the full handshake).
+  static const Duration probeTimeout = Duration(seconds: 1);
+
   static const Duration connectTimeout  = Duration(seconds: 5);
   static const Duration handshakeTimeout = Duration(seconds: 8);
   static const Duration sessionTimeout   = Duration(seconds: 10);

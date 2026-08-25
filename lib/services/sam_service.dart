@@ -9,6 +9,15 @@ import 'package:crypto/crypto.dart';
 import '../core/constants.dart';
 import 'sam_channel.dart';
 
+/// Result of the fast SAM-bridge reachability probe.
+enum SamReachability {
+  /// Something accepted a TCP connection on the SAM host/port.
+  reachable,
+
+  /// Connection refused, failed, or timed out — treat as "no router".
+  unreachable,
+}
+
 /// Singleton service implementing the I2P SAM v3.3 bridge protocol.
 ///
 /// Features:
@@ -17,6 +26,10 @@ import 'sam_channel.dart';
 ///   • Inbound transport via SAM STREAM FORWARD (STREAM ACCEPT fallback)
 ///   • Bounded-backoff automatic reconnect on control-socket loss
 ///   • Real-time broadcast stream for incoming peer messages
+///
+///   • Fast reachability probe ([probeReachability]) for startup flow routing
+///   • Cold-start reconnect arming ([startReconnectLoop]) so a router that
+///     comes up after app launch is picked up automatically
 ///
 /// The status/log streams carry ONLY state SAM v3 actually reports
 /// (connection, session, destination, inbound listener). Router-level
@@ -132,6 +145,45 @@ class SamService {
       _isConnected = false;
       _emitStatus('disconnected');
       return false;
+    }
+  }
+
+  /// Fast startup probe: can anything accept a TCP connection on the SAM
+  /// bridge host/port right now?
+  ///
+  /// Deliberately cheaper and faster than a full [connectAndHandshake] —
+  /// no protocol bytes are written. Used by the splash flow to route between
+  /// the normal connect path and router-setup onboarding BEFORE attempting
+  /// the handshake.
+  ///
+  /// Args:
+  ///   timeout: Connect budget; a timeout is mapped to [SamReachability
+  ///       .unreachable], never propagated to the caller.
+  ///
+  /// Returns: [SamReachability.reachable] when a socket connects,
+  /// [SamReachability.unreachable] otherwise.
+  Future<SamReachability> probeReachability({
+    Duration timeout = KamuiConstants.probeTimeout,
+  }) async {
+    _log('info', 'Probing SAM bridge reachability at $host:$port…');
+    try {
+      final channel = await _channelFactory
+          .connect(host, port, timeout: timeout)
+          .timeout(timeout);
+      channel.destroy();
+      _log('success', 'SAM bridge reachable ($host:$port)');
+      return SamReachability.reachable;
+    } on SocketException catch (e) {
+      _log('warning', 'SAM bridge unreachable ($host:$port): $e');
+      return SamReachability.unreachable;
+    } on TimeoutException {
+      _log('warning',
+          'SAM bridge probe timed out after ${timeout.inMilliseconds}ms '
+          '($host:$port) — treating as unreachable');
+      return SamReachability.unreachable;
+    } catch (e) {
+      _log('warning', 'SAM bridge probe failed ($host:$port): $e');
+      return SamReachability.unreachable;
     }
   }
 
@@ -669,8 +721,21 @@ class SamService {
     _scheduleReconnect();
   }
 
-  void _scheduleReconnect() {
-    if (_disposed || _isReconnecting || !_hadLiveSession) return;
+  /// Arms the bounded-backoff reconnect loop from a COLD START.
+  ///
+  /// Mid-session control loss arms the loop automatically (via
+  /// [_handleControlLoss]); a failed cold start historically did not, so a
+  /// router launched after the app would never be noticed. Call this after a
+  /// failed cold-start connect to opt in: retries then run on the same
+  /// exponential backoff until a router appears or [dispose] cancels them.
+  /// Safe to call repeatedly — a no-op while the loop is already running.
+  void startReconnectLoop() {
+    _scheduleReconnect(overrideHadLiveSession: true);
+  }
+
+  void _scheduleReconnect({bool overrideHadLiveSession = false}) {
+    if (_disposed || _isReconnecting) return;
+    if (!_hadLiveSession && !overrideHadLiveSession) return;
     _isReconnecting = true;
     unawaited(_runReconnectLoop());
   }
@@ -681,6 +746,10 @@ class SamService {
     final capMs = KamuiConstants.reconnectMaxBackoff.inMilliseconds;
 
     while (!_disposed) {
+      // Another path (e.g. manual retry from RouterSetupScreen) already
+      // restored the link while this loop was sleeping — stand down.
+      if (_isConnected && _isSessionCreated) break;
+
       _log('info', 'Reconnecting in ${_jitter(delayMs)}ms…');
       _emitStatus('reconnecting');
       await Future<void>.delayed(Duration(milliseconds: _jitter(delayMs)));

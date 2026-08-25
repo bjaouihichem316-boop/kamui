@@ -6,11 +6,13 @@ import '../core/constants.dart';
 import '../core/providers.dart';
 import '../core/theme.dart';
 import '../services/lock_service.dart';
+import '../services/sam_service.dart';
 import '../widgets/hud_background.dart';
 import '../widgets/kamui_button.dart';
 import '../widgets/vortex_ring.dart';
 import 'chat_list_screen.dart';
 import 'lock_screen.dart';
+import 'router_setup_screen.dart';
 
 class SplashScreen extends ConsumerStatefulWidget {
   const SplashScreen({super.key});
@@ -55,35 +57,103 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
     _initSamBridge();
   }
 
+  /// Startup transport flow:
+  ///  1. Fast reachability probe against the SAM bridge port.
+  ///  2. Reachable → full connect → session → inbound listener chain.
+  ///  3. Nothing listening → honest offline mode: arm the cold-start
+  ///     reconnect loop (so a late-starting router is picked up) and hand
+  ///     the user to [RouterSetupScreen] instead of pretending a local node
+  ///     exists.
   Future<void> _initSamBridge() async {
     final sam = ref.read(samServiceProvider);
 
-    _updateStatus('Connecting to SAM Bridge (127.0.0.1:7656)…');
+    _updateStatus('Probing SAM Bridge (127.0.0.1:7656)…');
     await Future<void>.delayed(const Duration(milliseconds: 600));
 
+    final reachable = await sam.probeReachability();
+    if (!mounted) return;
+
+    if (reachable == SamReachability.reachable) {
+      await _connectFullStack(sam);
+      return;
+    }
+    _enterOfflineMode(sam);
+  }
+
+  /// Connect → session → inbound chain. Only called after the probe confirmed
+  /// something is listening on the SAM port.
+  Future<void> _connectFullStack(SamService sam) async {
+    _updateStatus('Connecting to SAM Bridge…');
     final connected = await sam.connectAndHandshake();
     if (!mounted) return;
 
-    if (connected) {
-      _updateStatus('Establishing Garlic STREAM Session…');
-      final sessionOk = await sam.createSession('KamuiSession');
-      if (!mounted) return;
+    if (!connected) {
+      // Probe raced a router shutdown — fall back to the offline path.
+      _enterOfflineMode(sam);
+      return;
+    }
 
-      if (sessionOk) {
-        // createSession() already armed the inbound listener; this explicit
-        // re-arm is idempotent and keeps boot status honest.
-        _updateStatus('Arming Inbound Garlic Listener…');
-        await sam.startInbound();
-        if (!mounted) return;
-        _updateStatus('Garlic Destination Acquired • Active');
-      } else {
-        _updateStatus('Handshake OK • Session Standby Mode');
-      }
+    _updateStatus('Establishing Garlic STREAM Session…');
+    final sessionOk = await sam.createSession('KamuiSession');
+    if (!mounted) return;
+
+    if (sessionOk) {
+      // createSession() already armed the inbound listener; this explicit
+      // re-arm is idempotent and keeps boot status honest.
+      _updateStatus('Arming Inbound Garlic Listener…');
+      await sam.startInbound();
+      if (!mounted) return;
+      _updateStatus('Garlic Destination Acquired • Active');
     } else {
-      _updateStatus('SAM Offline • Running Local Node Mode');
+      _updateStatus('Handshake OK • Session Standby Mode');
     }
 
     setState(() => _isConnecting = false);
+  }
+
+  /// Honest offline path: no router answered the probe. Arms the cold-start
+  /// reconnect loop and shows [RouterSetupScreen]. The splash stays mounted
+  /// beneath the (non-poppable) setup route so its callbacks remain valid.
+  void _enterOfflineMode(SamService sam) {
+    _updateStatus('Offline — No I2P Router Detected');
+    sam.startReconnectLoop();
+
+    Navigator.push(
+      context,
+      PageRouteBuilder(
+        pageBuilder: (context, anim, secondaryAnim) => RouterSetupScreen(
+          onRetry: _retryFromSetup,
+          onContinueOffline: _enterTheVoid,
+        ),
+        transitionDuration: const Duration(milliseconds: 600),
+        transitionsBuilder: (context, anim, secondaryAnim, child) =>
+            FadeTransition(
+          opacity: anim,
+          child: child,
+        ),
+      ),
+    );
+  }
+
+  /// RETRY from [RouterSetupScreen]: probe → connect → session → inbound.
+  /// On success routes through the lock gate and clears the whole stack.
+  /// On failure the setup screen stays up — its live status line keeps
+  /// showing the background auto-retry state.
+  Future<void> _retryFromSetup() async {
+    final sam = ref.read(samServiceProvider);
+
+    final reachable = await sam.probeReachability();
+    if (!mounted || reachable != SamReachability.reachable) return;
+
+    final connected = await sam.connectAndHandshake();
+    if (!mounted || !connected) return;
+
+    final sessionOk = await sam.createSession('KamuiSession');
+    if (!mounted || !sessionOk) return;
+    await sam.startInbound();
+    if (!mounted) return;
+
+    await _enterTheVoid();
   }
 
   void _updateStatus(String msg) {
@@ -100,10 +170,13 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
 
   /// Routes through the lock gate: when the shield is armed, the user must
   /// authenticate before reaching any chat surface.
+  ///
+  /// Clears the entire navigation stack (splash + any RouterSetupScreen on
+  /// top of it), so no dead entry surface survives underneath.
   Future<void> _enterTheVoid() async {
     final lockEnabled = await LockService().isLockEnabled();
     if (!mounted) return;
-    Navigator.pushReplacement(
+    Navigator.pushAndRemoveUntil(
       context,
       PageRouteBuilder(
         pageBuilder: (context, anim, secondaryAnim) =>
@@ -115,6 +188,7 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
           child: child,
         ),
       ),
+      (route) => false,
     );
   }
 
