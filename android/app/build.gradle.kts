@@ -26,7 +26,7 @@ if (hasReleaseKeystore) {
 }
 
 android {
-    namespace = "com.example.kamui"
+    namespace = "net.kamui.messenger"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
