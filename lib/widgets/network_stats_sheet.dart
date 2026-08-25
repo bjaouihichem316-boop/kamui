@@ -4,10 +4,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../core/theme.dart';
 import '../core/providers.dart';
+import '../services/sam_service.dart';
 
 /// Cyberpunk HUD terminal bottom sheet — shows SAM network statistics and live log.
 ///
-/// FIX BUG-005: [_bwIn] is now correctly updated in [_onStatusUpdate].
+/// Only state the SAM v3 bridge actually reports is displayed (connection,
+/// session, destination). Router-level metrics (tunnel counts, bandwidth,
+/// NAT status) are not exposed by SAM v3 and render as "—".
 class NetworkStatsSheet extends ConsumerStatefulWidget {
   const NetworkStatsSheet({super.key});
 
@@ -16,15 +19,16 @@ class NetworkStatsSheet extends ConsumerStatefulWidget {
 }
 
 class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
-  // ── State ──────────────────────────────────────────────────────────────
-  int    _inboundTunnels  = 5;
-  int    _outboundTunnels = 3;
-  double _bwIn            = 0.42; // fraction 0..1
-  double _bwOut           = 0.18; // fraction 0..1
-  String _natStatus       = '🟢 OK (Relay Active)';
-  String _sessionId       = 'AetherTestSession';
-  String _localDest       = '';
+  /// Placeholder for metrics the SAM v3 bridge does not expose.
+  static const String _notExposed = '—';
+
+  /// Explanation shown wherever [_notExposed] appears.
+  static const String _routerStatsNote = 'Router stats not exposed via SAM v3';
+
+  // ── State (real SAM session data only) ────────────────────────────────
   bool   _isLive          = false;
+  String _sessionId       = _notExposed;
+  String _localDest       = '';
   String _connectionStatus = 'Idle';
 
   final List<Map<String, dynamic>> _logs = [];
@@ -45,35 +49,23 @@ class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
     _logSub    = sam.logStream.listen(_onLogEntry);
   }
 
-  void _applyState(dynamic sam) {
+  void _applyState(SamService sam) {
     setState(() {
-      _isLive          = sam.isConnected as bool;
-      _inboundTunnels  = (sam.inboundTunnels  as int) > 0 ? sam.inboundTunnels  as int : _inboundTunnels;
-      _outboundTunnels = (sam.outboundTunnels as int) > 0 ? sam.outboundTunnels as int : _outboundTunnels;
-      _bwIn            = (sam.bandwidthInKbps  as double) > 0 ? (sam.bandwidthInKbps  as double) / 100 : _bwIn;
-      _bwOut           = (sam.bandwidthOutKbps as double) > 0 ? (sam.bandwidthOutKbps as double) / 100 : _bwOut;
-      _sessionId       = sam.sessionId as String? ?? _sessionId;
-      _localDest       = sam.localDestinationKey as String? ?? '';
-      _natStatus       = _isLive ? '🟢 OK (SAM Bridge Active)' : '⚫ Disconnected';
-      _connectionStatus = (sam.isSessionCreated as bool)
+      _isLive    = sam.isConnected;
+      _sessionId = sam.sessionId ?? _notExposed;
+      _localDest = sam.localDestinationKey ?? '';
+      _connectionStatus = sam.isSessionCreated
           ? 'Session Active'
           : _isLive ? 'Connected' : 'Idle';
     });
   }
 
-  // FIX BUG-005: _bwIn is now updated alongside _bwOut.
   void _onStatusUpdate(Map<String, dynamic> status) {
     if (!mounted) return;
     setState(() {
       _isLive          = status['isConnected']    as bool?   ?? false;
       _sessionId       = status['sessionId']      as String? ?? _sessionId;
       _localDest       = status['localDestinationKey'] as String? ?? '';
-      _inboundTunnels  = (status['inboundTunnels']  as num? ?? _inboundTunnels).toInt();
-      _outboundTunnels = (status['outboundTunnels'] as num? ?? _outboundTunnels).toInt();
-      // BUG-005 FIX ↓
-      _bwIn            = (status['bandwidthInKbps']  as num? ?? _bwIn  * 100).toDouble() / 100;
-      _bwOut           = (status['bandwidthOutKbps'] as num? ?? _bwOut * 100).toDouble() / 100;
-      _natStatus       = _isLive ? '🟢 OK (SAM Bridge Active)' : '⚫ Disconnected';
       _connectionStatus = status['status'] as String? ?? _connectionStatus;
     });
   }
@@ -153,33 +145,42 @@ class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
             _divider(),
             const SizedBox(height: 14),
 
-            // Stats (Simulated Telemetry)
+            // Stats — only values SAM v3 actually reports
             _statRow(icon: Icons.wifi, label: 'SAM Status',
                 value: _connectionStatus,
                 color: _isLive ? emeraldGlow : textMid),
             const SizedBox(height: 10),
             _statRow(icon: Icons.arrow_downward, label: 'Inbound Tunnels',
-                value: '$_inboundTunnels active (Simulated)', color: cyberCyan),
+                value: _notExposed, color: textMid,
+                tooltip: _routerStatsNote),
             const SizedBox(height: 10),
             _statRow(icon: Icons.arrow_upward, label: 'Outbound Tunnels',
-                value: '$_outboundTunnels active (Simulated)', color: cyberCyan),
+                value: _notExposed, color: textMid,
+                tooltip: _routerStatsNote),
             const SizedBox(height: 16),
             _divider(),
             const SizedBox(height: 14),
 
-            // Bandwidth meters
+            // Bandwidth — SAM v3 exposes no throughput stats; honest dashes.
             Text(
-              'BANDWIDTH (SIMULATED TELEMETRY)',
+              'BANDWIDTH',
               style: GoogleFonts.jetBrainsMono(
                 fontSize: 10, color: textDim, letterSpacing: 2,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _routerStatsNote,
+              style: GoogleFonts.jetBrainsMono(
+                fontSize: 9, color: textDim, letterSpacing: 0.5,
               ),
             ),
             const SizedBox(height: 10),
             Row(
               children: [
-                Expanded(child: _meter('INBOUND',  '${(_bwIn  * 100).toStringAsFixed(1)} KB/s', _bwIn,  cyberCyan)),
+                Expanded(child: _meter('INBOUND',  _notExposed, 0, cyberCyan)),
                 const SizedBox(width: 14),
-                Expanded(child: _meter('OUTBOUND', '${(_bwOut * 100).toStringAsFixed(1)} KB/s', _bwOut, neonPurple)),
+                Expanded(child: _meter('OUTBOUND', _notExposed, 0, neonPurple)),
               ],
             ),
 
@@ -188,8 +189,8 @@ class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
             const SizedBox(height: 14),
 
             _statRow(icon: Icons.shield_outlined, label: 'NAT / CGNAT',
-                value: _natStatus,
-                color: _isLive ? emeraldGlow : textMid),
+                value: _notExposed, color: textMid,
+                tooltip: _routerStatsNote),
             const SizedBox(height: 10),
             _statRow(icon: Icons.fingerprint, label: 'Session ID',
                 value: _sessionId, color: textMid),
@@ -293,7 +294,7 @@ class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
         border: Border.all(color: (isLive ? emeraldGlow : textDim).withAlpha(60)),
       ),
       child: Text(
-        isLive ? '● LIVE' : '○ MOCK',
+        isLive ? '● LIVE' : '○ OFFLINE',
         style: GoogleFonts.jetBrainsMono(
           fontSize: 9,
           fontWeight: FontWeight.w700,
@@ -320,7 +321,20 @@ class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
     required String   label,
     required String   value,
     required Color    color,
+    String?           tooltip,
   }) {
+    final valueText = Text(
+      value,
+      style: GoogleFonts.jetBrainsMono(
+        fontSize:   11,
+        fontWeight: FontWeight.w700,
+        color:      color,
+        letterSpacing: 0.3,
+      ),
+      textAlign: TextAlign.end,
+      maxLines:  1,
+      overflow:  TextOverflow.ellipsis,
+    );
     return Row(
       children: [
         Icon(icon, size: 14, color: vortexOrange.withAlpha(160)),
@@ -332,18 +346,9 @@ class _NetworkStatsSheetState extends ConsumerState<NetworkStatsSheet> {
           ),
         ),
         Flexible(
-          child: Text(
-            value,
-            style: GoogleFonts.jetBrainsMono(
-              fontSize:   11,
-              fontWeight: FontWeight.w700,
-              color:      color,
-              letterSpacing: 0.3,
-            ),
-            textAlign: TextAlign.end,
-            maxLines:  1,
-            overflow:  TextOverflow.ellipsis,
-          ),
+          child: tooltip == null
+              ? valueText
+              : Tooltip(message: tooltip, child: valueText),
         ),
       ],
     );

@@ -55,6 +55,12 @@ class KamuiConstants {
   static const Duration sessionTimeout   = Duration(seconds: 10);
   static const Duration sendTimeout      = Duration(seconds: 15);
 
+  // ─── Lock Screen ──────────────────────────────────────────────
+  /// Time allowed in background before the lock gate engages on resume.
+  /// [Duration.zero] = immediate lock on ANY backgrounding (default policy).
+  /// Consumed by the lifecycle observer in `main.dart` (`_lockIfExpired`).
+  static const Duration autoLockTimeout = Duration.zero;
+
   // ─── UI Dimensions ────────────────────────────────────────────
   static const double vortexRingSizeLarge  = 160.0;
   static const double vortexRingSizeMedium = 120.0;
@@ -76,8 +82,13 @@ class KamuiConstants {
   static const Duration scanLineDuration       = Duration(milliseconds: 4000);
 
   // ─── Mock / Dev ───────────────────────────────────────────────
-  /// Master switch for mock seed data. Only honored in debug builds
-  /// (`kDebugMode`); release/profile builds never seed mock data.
+  /// Master switch for mock seed data (personas, conversations, messages).
+  ///
+  /// Honored ONLY in debug builds: the Phase-0 gate lives in
+  /// `core/providers.dart` (`_mockSeedingEnabled = useMockData && kDebugMode`),
+  /// so release/profile builds never seed mock identities or conversations
+  /// regardless of this flag. This constant gates UI seed data only — it has
+  /// no effect on SAM transport, crypto, or persistence behavior.
   static const bool useMockData = true;
 
   /// Debug-only universal unlock PIN for the lock screen so developers are

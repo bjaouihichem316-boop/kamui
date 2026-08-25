@@ -423,9 +423,14 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
             children: [
               Text('Inbound Tunnels',
                   style: GoogleFonts.jetBrainsMono(color: textMid, fontSize: 11)),
-              Text('${sam.inboundTunnels} active (3 hops)',
-                  style: GoogleFonts.jetBrainsMono(
-                      color: cyberCyan, fontSize: 11, fontWeight: FontWeight.w700)),
+              Tooltip(
+                message: 'Router stats not exposed via SAM v3',
+                child: Text('—',
+                    style: GoogleFonts.jetBrainsMono(
+                        color: textMid,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700)),
+              ),
             ],
           ),
           const SizedBox(height: 8),
@@ -446,9 +451,14 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
             children: [
               Text('Outbound Tunnels',
                   style: GoogleFonts.jetBrainsMono(color: textMid, fontSize: 11)),
-              Text('${sam.outboundTunnels} active (3 hops)',
-                  style: GoogleFonts.jetBrainsMono(
-                      color: cyberCyan, fontSize: 11, fontWeight: FontWeight.w700)),
+              Tooltip(
+                message: 'Router stats not exposed via SAM v3',
+                child: Text('—',
+                    style: GoogleFonts.jetBrainsMono(
+                        color: textMid,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700)),
+              ),
             ],
           ),
           const SizedBox(height: 8),

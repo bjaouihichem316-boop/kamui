@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../core/app_logger.dart';
 import '../core/theme.dart';
 import '../core/providers.dart';
 import '../models/contact.dart';
@@ -29,6 +30,8 @@ class AddFriendScreen extends ConsumerStatefulWidget {
 
 class _AddFriendScreenState extends ConsumerState<AddFriendScreen>
     with SingleTickerProviderStateMixin {
+  static const _log = AppLogger('AddFriend');
+
   final _formKey         = GlobalKey<FormState>();
   final _nameController  = TextEditingController();
   final _destController  = TextEditingController();
@@ -111,7 +114,10 @@ class _AddFriendScreenState extends ConsumerState<AddFriendScreen>
           convId,
           peerPreKeyBundleJson: bundleJson,
         );
-      } catch (_) {}
+      } catch (_) {
+        _log.w('V4 pre-session setup failed for "$name" — '
+            'session will be established on first message exchange');
+      }
     }
 
     final welcomeMsg = Message(

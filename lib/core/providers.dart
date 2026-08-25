@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/app_logger.dart';
 import '../core/theme.dart';
 import '../models/contact.dart';
 import '../models/conversation.dart';
@@ -32,6 +33,9 @@ import 'constants.dart';
 /// receive empty data so shipped binaries contain no fake identities,
 /// conversations, or messages.
 bool get _mockSeedingEnabled => KamuiConstants.useMockData && kDebugMode;
+
+/// Logger for inbound peer-message routing (decryption fallback paths).
+const _incomingMsgLog = AppLogger('IncomingMessages');
 
 /// Singleton [CryptoService]. Must be initialized in main() before use.
 final cryptoServiceProvider = Provider<CryptoService>((ref) {
@@ -260,6 +264,9 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
           );
         } catch (_) {
           // Decryption failed or session desynchronized
+          _incomingMsgLog.w(
+            'V4 decrypt failed for ${targetConv.id} — storing placeholder text',
+          );
         }
       } else if (encryptedPayload.startsWith('kamui_v2:')) {
         try {
@@ -272,7 +279,11 @@ final incomingMessageListenerProvider = Provider<void>((ref) {
           if (dec != null) {
             decryptedPlaintext = dec;
           }
-        } catch (_) {}
+        } catch (_) {
+          _incomingMsgLog.w(
+            'V2 decrypt failed for ${targetConv.id} — storing placeholder text',
+          );
+        }
       }
 
       // If decryption succeeded: store plaintext (MessageRepository encrypts it locally with AES before saving).
@@ -332,13 +343,17 @@ final outboxRetryListenerProvider = Provider<void>((ref) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 class ConversationsNotifier extends AsyncNotifier<List<Conversation>> {
+  static const _log = AppLogger('ConversationsProvider');
+
   @override
   Future<List<Conversation>> build() async {
     try {
       final repo  = ref.watch(conversationRepositoryProvider);
       final saved = await repo.getAll();
       if (saved.isNotEmpty) return saved;
-    } catch (_) {}
+    } catch (_) {
+      _log.e('Failed to load persisted conversations — falling back to seed/empty');
+    }
     if (!_mockSeedingEnabled) return const [];
     return _buildMockConversations();
   }
@@ -478,13 +493,17 @@ final conversationsProvider =
 // ═══════════════════════════════════════════════════════════════════════════
 
 class MessagesNotifier extends FamilyAsyncNotifier<List<Message>, String> {
+  static const _log = AppLogger('MessagesProvider');
+
   @override
   Future<List<Message>> build(String conversationId) async {
     try {
       final repo  = ref.watch(messageRepositoryProvider);
       final saved = await repo.getByConversation(conversationId);
       if (saved.isNotEmpty) return saved;
-    } catch (_) {}
+    } catch (_) {
+      _log.e('Failed to load persisted messages for "$conversationId" — falling back to seed/empty');
+    }
     if (!_mockSeedingEnabled) return const [];
     return _mockMessages[conversationId] ?? [];
   }

@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 
+import '../core/app_logger.dart';
 import 'crypto_service.dart';
 import 'database_service.dart';
 
@@ -42,6 +43,8 @@ class OutboxEntry {
 /// was re-established in the meantime, the stale ciphertext is rejected by the
 /// receiver's ratchet (fail-closed) — at-most-once delivery semantics.
 class OutboxService {
+  static const _log = AppLogger('Outbox');
+
   // ─── Singleton ─────────────────────────────────────────────────────────────
   static final OutboxService _instance = OutboxService._internal();
   factory OutboxService() => _instance;
@@ -109,7 +112,10 @@ class OutboxService {
     final database = await _db.db;
     try {
       await database.delete('outbox', where: 'id = ?', whereArgs: [id]);
-    } catch (_) {}
+    } catch (_) {
+      _log.e('Failed to dequeue outbox entry $id after delivery — '
+          'a retry pass may re-send it');
+    }
   }
 
   /// Attempts to deliver the entry with [id] via [send]. Returns `true` when
@@ -185,7 +191,9 @@ class OutboxService {
         'UPDATE outbox SET retry_count = retry_count + 1 WHERE id = ?',
         [entry.id],
       );
-    } catch (_) {}
+    } catch (_) {
+      _log.w('Failed to bump retry counter for outbox entry ${entry.id}');
+    }
     return false;
   }
 

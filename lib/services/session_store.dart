@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 
+import '../core/app_logger.dart';
 import 'crypto_service.dart';
 import 'database_service.dart';
 
@@ -31,6 +32,8 @@ abstract class SessionStore {
 /// SQLite-backed [SessionStore]. Blobs are AES-256-GCM encrypted with the
 /// local [CryptoService] key before insert (`sessions` table, schema v3).
 class SqliteSessionStore implements SessionStore {
+  static const _log = AppLogger('SessionStore');
+
   final DatabaseService _dbService;
   final CryptoService _crypto;
 
@@ -60,6 +63,7 @@ class SqliteSessionStore implements SessionStore {
       return decrypted;
     } catch (_) {
       // Storage unavailable / schema missing → behave as "no saved session".
+      _log.w('Session store load failed for "$conversationId" — treating as absent');
       return null;
     }
   }
@@ -89,6 +93,7 @@ class SqliteSessionStore implements SessionStore {
       );
     } catch (_) {
       // Table may not exist pre-migration — nothing to delete.
+      _log.d('Session store delete skipped (table missing?) for "$conversationId"');
     }
   }
 
@@ -99,6 +104,7 @@ class SqliteSessionStore implements SessionStore {
       await database.delete('sessions');
     } catch (_) {
       // Table may not exist pre-migration — nothing to delete.
+      _log.d('Session store deleteAll skipped (table missing?)');
     }
   }
 }

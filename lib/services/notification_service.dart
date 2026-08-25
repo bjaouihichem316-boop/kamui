@@ -1,7 +1,11 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
+import '../core/app_logger.dart';
+
 /// Service for delivering native local notifications when encrypted I2P messages arrive.
 class NotificationService {
+  static const _log = AppLogger('Notifications');
+
   static final NotificationService _instance = NotificationService._internal();
   factory NotificationService() => _instance;
   NotificationService._internal();
@@ -42,6 +46,7 @@ class NotificationService {
       _isInitialized = true;
     } catch (_) {
       // Fallback on platform configuration error
+      _log.w('Notification plugin init failed — notifications disabled this session');
     }
   }
 
@@ -81,7 +86,7 @@ class NotificationService {
         platformDetails,
       );
     } catch (_) {
-      // Gracefully ignore notification errors
+      _log.w('Failed to display notification');
     }
   }
 
@@ -89,6 +94,8 @@ class NotificationService {
   Future<void> cancelAllNotifications() async {
     try {
       await _notificationsPlugin.cancelAll();
-    } catch (_) {}
+    } catch (_) {
+      _log.w('Failed to cancel active notifications');
+    }
   }
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'core/constants.dart';
 import 'core/providers.dart';
 import 'core/theme.dart';
 import 'screens/lock_screen.dart';
@@ -45,10 +46,6 @@ class _KamuiAppState extends ConsumerState<KamuiApp>
     with WidgetsBindingObserver {
   final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
 
-  /// Time allowed in background before the lock gate engages on resume.
-  /// [Duration.zero] = immediate lock on ANY backgrounding (default policy).
-  static const Duration autoLockTimeout = Duration.zero;
-
   DateTime? _backgroundedAt;
 
   @override
@@ -76,12 +73,15 @@ class _KamuiAppState extends ConsumerState<KamuiApp>
   }
 
   /// Re-arms the lock gate when the app was backgrounded longer than
-  /// [autoLockTimeout]. No-op when the shield is not enabled.
+  /// [KamuiConstants.autoLockTimeout]. No-op when the shield is not enabled.
   void _lockIfExpired() {
     final backgroundedAt = _backgroundedAt;
     _backgroundedAt = null;
     if (backgroundedAt == null) return;
-    if (DateTime.now().difference(backgroundedAt) < autoLockTimeout) return;
+    if (DateTime.now().difference(backgroundedAt) <
+        KamuiConstants.autoLockTimeout) {
+      return;
+    }
     _presentLockScreen();
   }
 

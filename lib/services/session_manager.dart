@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:cryptography/cryptography.dart';
+import '../core/app_logger.dart';
 import 'double_ratchet.dart';
 import 'crypto_service.dart';
 import 'database_service.dart';
@@ -87,6 +88,8 @@ class SessionState {
 /// [encryptMessage] ALWAYS throws [SessionUnavailableException] on any error.
 /// There is NO silent fallback to plaintext or weaker encryption.
 class SessionManager {
+  static const _log = AppLogger('SessionManager');
+
   static final SessionManager _instance = SessionManager._internal();
   factory SessionManager() => _instance;
 
@@ -553,7 +556,9 @@ class SessionManager {
             session.commitReceive();
             return utf8.decode(clearBytes);
           } catch (_) {
-            // MAC failure — counter NOT advanced, no ratchet desync
+            // MAC failure — counter NOT advanced, no ratchet desync.
+            // Expected for stale/replayed outbox retries; keep at debug level.
+            _log.d('V2 MAC verification failed for "$conversationId" — payload dropped');
           }
         }
       }
@@ -571,6 +576,7 @@ class SessionManager {
       await _getSessionStore().deleteAll();
     } catch (_) {
       // Store already gone (e.g. DB file nuked first) — nothing left to delete.
+      _log.d('Session store already unavailable during reset — nothing to delete');
     }
   }
 
@@ -590,6 +596,8 @@ class SessionManager {
       );
     } catch (_) {
       // Best-effort persistence — see docstring.
+      _log.w('Ratchet persistence failed for "${session.conversationId}" — '
+          'continuing in-memory (state lost on restart)');
     }
   }
 
@@ -615,9 +623,13 @@ class SessionManager {
       return session;
     } catch (_) {
       // Any corruption → discard blob so fresh X3DH can proceed cleanly.
+      _log.w('Persisted ratchet state corrupt for "$conversationId" — '
+          'discarding blob (fresh X3DH required)');
       try {
         await _getSessionStore().delete(conversationId);
-      } catch (_) {}
+      } catch (_) {
+        _log.d('Corrupt ratchet blob cleanup failed for "$conversationId"');
+      }
       return null;
     }
   }

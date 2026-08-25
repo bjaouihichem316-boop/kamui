@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 
+import '../core/app_logger.dart';
 import '../core/constants.dart';
 import 'identity_key_service.dart';
 import 'notification_service.dart';
@@ -17,6 +18,8 @@ import 'session_manager.dart';
 ///   • Automatic deletion of self-destructed / TTL expired messages
 ///   • Complete nuke / purge capability for Panic / Duress Mode
 class DatabaseService {
+  static const _log = AppLogger('DatabaseService');
+
   // ─── Singleton ───────────────────────────────────────────────────────────
   static final DatabaseService _instance = DatabaseService._internal();
   factory DatabaseService() => _instance;
@@ -158,7 +161,9 @@ class DatabaseService {
         iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
       );
       await storage.deleteAll();
-    } catch (_) {}
+    } catch (_) {
+      _log.e('Nuke: secure storage deleteAll failed — key material may remain');
+    }
 
     // 3. Cancel all active OS notifications
     await NotificationService().cancelAllNotifications();
@@ -175,13 +180,17 @@ class DatabaseService {
       if (await tempDir.exists()) {
         await tempDir.delete(recursive: true);
       }
-    } catch (_) {}
+    } catch (_) {
+      _log.w('Nuke: cache directory cleanup failed');
+    }
 
     // 6. Clear persisted UI preferences — no theme residue may survive a wipe.
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(KamuiConstants.themePrefsKey);
-    } catch (_) {}
+    } catch (_) {
+      _log.w('Nuke: theme preference cleanup failed');
+    }
   }
 
   /// Closes the database connection.

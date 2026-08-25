@@ -16,8 +16,12 @@ import 'sam_channel.dart';
 ///   • Live stream sockets for outbound and inbound messages
 ///   • Inbound transport via SAM STREAM FORWARD (STREAM ACCEPT fallback)
 ///   • Bounded-backoff automatic reconnect on control-socket loss
-///   • Dynamic telemetry updates for active tunnels and bandwidth
 ///   • Real-time broadcast stream for incoming peer messages
+///
+/// The status/log streams carry ONLY state SAM v3 actually reports
+/// (connection, session, destination, inbound listener). Router-level
+/// metrics such as tunnel counts and bandwidth are NOT exposed by the
+/// SAM v3.3 bridge protocol and are therefore never fabricated here.
 class SamService {
   // ─── Singleton ────────────────────────────────────────────────────────
   static final SamService _instance = SamService._internal();
@@ -58,16 +62,6 @@ class SamService {
 
   bool get isConnected      => _isConnected;
   bool get isSessionCreated => _isSessionCreated;
-
-  // ─── Simulated / Mock Telemetry ─────────────────────────────────────
-  /// [SIMULATED/MOCK TELEMETRY] Active tunnel counts & bandwidth metrics
-  /// (Placeholder until SAM v3.3 stats reader is attached)
-  int    inboundTunnels    = 5;
-  int    outboundTunnels   = 3;
-  double bandwidthInKbps   = 14.2;
-  double bandwidthOutKbps  = 6.8;
-
-  Timer? _telemetryTimer;
 
   // ─── Internal socket read buffer ─────────────────────────────────────
   String _buffer = '';
@@ -122,7 +116,6 @@ class SamService {
 
       if (result) {
         _log('success', 'SAM handshake OK (v3.3)');
-        _startTelemetry();
       } else {
         _log('error', 'SAM handshake failed (reply: ${reply ?? "timeout"})');
       }
@@ -375,7 +368,6 @@ class SamService {
   void dispose() {
     _disposed       = true;
     _isReconnecting = false;
-    _telemetryTimer?.cancel();
     unawaited(_teardownInboundListener());
     _controlSocket?.destroy();
     _controlSocket     = null;
@@ -392,7 +384,7 @@ class SamService {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // INTERNAL — Socket Dispatcher & Telemetry
+  // INTERNAL — Socket Dispatcher
   // ═══════════════════════════════════════════════════════════════════════
 
   void _attachSocketListener() {
@@ -699,20 +691,6 @@ class SamService {
     return (ms * factor).round();
   }
 
-  void _startTelemetry() {
-    _telemetryTimer?.cancel();
-    _telemetryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (!_isConnected) return;
-      // Fluctuate telemetry values dynamically for real-time responsiveness
-      final tick = DateTime.now().second;
-      bandwidthInKbps  = 12.0 + (tick % 7) * 2.1;
-      bandwidthOutKbps = 4.0  + (tick % 5) * 1.3;
-      inboundTunnels   = 5 + (tick % 2);
-      outboundTunnels  = 3 + (tick % 3);
-      _emitStatus('active');
-    });
-  }
-
   void _write(String cmd) {
     _log('data', '>>> $cmd');
     _controlSocket?.writeUtf8('$cmd\n');
@@ -735,10 +713,6 @@ class SamService {
       'isSessionCreated':   _isSessionCreated,
       'sessionId':          sessionId,
       'localDestinationKey': localDestinationKey,
-      'inboundTunnels':     inboundTunnels,
-      'outboundTunnels':    outboundTunnels,
-      'bandwidthInKbps':    bandwidthInKbps,
-      'bandwidthOutKbps':   bandwidthOutKbps,
     });
   }
 
