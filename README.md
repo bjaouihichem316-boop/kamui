@@ -2,6 +2,7 @@
 
 ## Untouchable Serverless Communication over I2P Network
 
+[![CI](https://img.shields.io/github/actions/workflow/status/bjaouihichem316-boop/kamui/ci.yml?branch=main&label=CI&logo=github)](https://github.com/bjaouihichem316-boop/kamui/actions/workflows/ci.yml)
 [![Flutter](https://img.shields.io/badge/Flutter-3.29-02569B?logo=flutter&logoColor=white)](https://flutter.dev)
 [![Dart](https://img.shields.io/badge/Dart-3.12-0175C2?logo=dart&logoColor=white)](https://dart.dev)
 [![I2P SAM](https://img.shields.io/badge/Protocol-I2P_SAM_v3.3-6B46C1?logo=tor-project&logoColor=white)](https://geti2p.net)
