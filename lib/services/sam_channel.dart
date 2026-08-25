@@ -22,6 +22,11 @@ abstract class SamChannel {
 /// Listener socket yielding inbound [SamChannel] connections
 /// (the local end of a SAM STREAM FORWARD hand-off).
 abstract class SamServerChannel {
+  /// The actual bound local port. Differs from the requested port when the
+  /// listener was created via an ephemeral request (port 0) — callers MUST
+  /// read this before announcing the port to the router.
+  int get port;
+
   /// Accepted inbound connections.
   Stream<SamChannel> get connections;
 
@@ -80,6 +85,9 @@ class IoSamServerChannel implements SamServerChannel {
   final ServerSocket _serverSocket;
 
   IoSamServerChannel(this._serverSocket);
+
+  @override
+  int get port => _serverSocket.port;
 
   @override
   Stream<SamChannel> get connections =>

@@ -7,6 +7,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../core/constants.dart';
 import '../core/providers.dart';
 import '../core/theme.dart';
+import '../services/auto_lock_settings.dart';
 import '../services/lock_service.dart';
 import '../services/sam_service.dart';
 import '../widgets/hud_background.dart';
@@ -27,6 +28,23 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
   bool _isReconnecting = false;
   int  _inboundHops     = 3;
   int  _outboundHops    = 3;
+  AutoLockOption _autoLock = AutoLockOption.immediate;
+
+  @override
+  void initState() {
+    super.initState();
+    AutoLockSettings.loadOption().then((option) {
+      if (!mounted) return;
+      setState(() => _autoLock = option);
+    });
+  }
+
+  /// Persists the new auto-lock policy; the lifecycle observer in main.dart
+  /// picks it up on the next resume (no restart required).
+  Future<void> _selectAutoLock(AutoLockOption option) async {
+    setState(() => _autoLock = option);
+    await AutoLockSettings.save(option);
+  }
 
   Future<void> _reconnectSam() async {
     setState(() => _isReconnecting = true);
@@ -235,7 +253,13 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
                       _buildSecurityShieldCard(),
                       const SizedBox(height: 24),
 
-                      // Section 6: Neon Theme Switcher
+                      // Section 6: Auto-Lock Timeout
+                      _buildSectionHeader(Icons.timer_outlined, 'AUTO-LOCK TIMEOUT'),
+                      const SizedBox(height: 12),
+                      _buildAutoLockCard(),
+                      const SizedBox(height: 24),
+
+                      // Section 7: Neon Theme Switcher
                       _buildSectionHeader(Icons.palette_outlined, 'NEON THEME SWITCHER'),
                       const SizedBox(height: 12),
                       _buildThemeSwitcherCard(ref.watch(neonThemeNotifierProvider)),
@@ -762,6 +786,60 @@ class _NodeSettingsScreenState extends ConsumerState<NodeSettingsScreen> {
         ),
       );
     }
+  }
+
+  /// Auto-lock timeout selector — segmented chips mirroring the hop-chip
+  /// styling. Selection persists immediately and applies on next resume.
+  Widget _buildAutoLockCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color:        panelDark,
+        borderRadius: BorderRadius.circular(12),
+        border:       Border.all(color: cyberCyan.withAlpha(20)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Lock the HUD after time in background:',
+            style: GoogleFonts.jetBrainsMono(color: textMid, fontSize: 11),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: AutoLockOption.values.map((option) {
+              final selected = option == _autoLock;
+              return GestureDetector(
+                onTap: () => _selectAutoLock(option),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: selected ? emeraldGlow.withAlpha(20) : surfaceDark,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: selected ? emeraldGlow : textDim.withAlpha(60),
+                      width: selected ? 1.5 : 1.0,
+                    ),
+                  ),
+                  child: Text(
+                    option.label,
+                    style: GoogleFonts.jetBrainsMono(
+                      fontSize: 10,
+                      color: selected ? emeraldGlow : textMid,
+                      fontWeight:
+                          selected ? FontWeight.w700 : FontWeight.normal,
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildThemeSwitcherCard(NeonTheme currentTheme) {

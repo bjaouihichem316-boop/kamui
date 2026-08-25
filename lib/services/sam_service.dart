@@ -489,13 +489,33 @@ class SamService {
 
   /// Arms SAM STREAM FORWARD: binds a local ServerSocket and hands its port
   /// to the router, which connects inbound I2P streams onto it.
+  ///
+  /// If the preferred port ([KamuiConstants.samForwardPort]) is already in
+  /// use (SocketException), the listener falls back to an OS-assigned
+  /// ephemeral port (bind port 0) and forwards THAT port instead. The
+  /// fallback is logged and emitted as `inbound_port_fallback` so it stays
+  /// observable. ACCEPT mode is untouched by this path.
   Future<void> _armForwardListener() async {
     final String id = sessionId!;
     try {
-      final SamServerChannel server = await _channelFactory.bind(
-        KamuiConstants.samForwardHost,
-        KamuiConstants.samForwardPort,
-      );
+      var boundPort = KamuiConstants.samForwardPort;
+      SamServerChannel server;
+      try {
+        server = await _channelFactory.bind(
+          KamuiConstants.samForwardHost,
+          KamuiConstants.samForwardPort,
+        );
+      } on SocketException catch (e) {
+        _log(
+          'warning',
+          'FORWARD port ${KamuiConstants.samForwardPort} unavailable ($e) — '
+          'retrying with an OS-assigned ephemeral port',
+        );
+        _emitStatus('inbound_port_fallback');
+        server = await _channelFactory.bind(KamuiConstants.samForwardHost, 0);
+        boundPort = server.port;
+        _log('info', 'FORWARD listener bound to ephemeral port $boundPort');
+      }
       if (_disposed || sessionId != id) {
         await server.close();
         return;
@@ -505,13 +525,13 @@ class SamService {
 
       _write(
         'STREAM FORWARD ID=$id '
-        'PORT=${KamuiConstants.samForwardPort} '
+        'PORT=$boundPort '
         'HOST=${KamuiConstants.samForwardHost} SILENT=false',
       );
       final ok = await _awaitForwardAck();
       if (ok) {
         _log('success',
-            'Inbound listener armed (FORWARD ${KamuiConstants.samForwardHost}:${KamuiConstants.samForwardPort})');
+            'Inbound listener armed (FORWARD ${KamuiConstants.samForwardHost}:$boundPort)');
       } else {
         _log('error', 'STREAM FORWARD rejected — inbound receive offline');
       }

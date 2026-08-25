@@ -71,6 +71,13 @@ class FakeChannel implements SamChannel {
 
 /// Fake listener socket whose connections are injected by the test.
 class FakeServerChannel implements SamServerChannel {
+  FakeServerChannel({this.port = 7657});
+
+  /// Bound port reported back to the service (ephemeral-bind simulations
+  /// construct with the OS-assigned port they want to advertise).
+  @override
+  final int port;
+
   // Synchronous delivery: accept() attaches the service's connection handler
   // before the test can push bytes into the accepted channel.
   final StreamController<SamChannel> _connections =

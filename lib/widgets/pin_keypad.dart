@@ -11,6 +11,7 @@ class PinKeypad extends StatelessWidget {
     required this.onDigit,
     required this.onBackspace,
     this.onBiometric,
+    this.enabled = true,
   });
 
   /// Called with the pressed digit ('0'–'9').
@@ -21,6 +22,9 @@ class PinKeypad extends StatelessWidget {
   /// Biometric action; when null the fingerprint slot renders as an
   /// invisible placeholder to preserve grid alignment.
   final VoidCallback? onBiometric;
+
+  /// When false every key renders disabled and ignores presses (lockout).
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -67,7 +71,7 @@ class PinKeypad extends StatelessWidget {
       width:  68,
       height: 68,
       child: OutlinedButton(
-        onPressed: () => onDigit(val),
+        onPressed: enabled ? () => onDigit(val) : null,
         style: OutlinedButton.styleFrom(
           shape: const CircleBorder(),
           side: BorderSide(color: cyberCyan.withAlpha(30)),
@@ -78,7 +82,7 @@ class PinKeypad extends StatelessWidget {
           style: GoogleFonts.orbitron(
             fontSize:   22,
             fontWeight: FontWeight.w700,
-            color:      textBright,
+            color:      enabled ? textBright : textDim,
           ),
         ),
       ),
@@ -95,8 +99,8 @@ class PinKeypad extends StatelessWidget {
       width:  68,
       height: 68,
       child: IconButton(
-        onPressed: onTap,
-        icon: Icon(icon, color: color, size: 24),
+        onPressed: enabled ? onTap : null,
+        icon: Icon(icon, color: enabled ? color : textDim, size: 24),
       ),
     );
   }

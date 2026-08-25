@@ -59,7 +59,13 @@ class KamuiConstants {
   /// Time allowed in background before the lock gate engages on resume.
   /// [Duration.zero] = immediate lock on ANY backgrounding (default policy).
   /// Consumed by the lifecycle observer in `main.dart` (`_lockIfExpired`).
+  /// This constant is the DEFAULT applied when no user selection is persisted.
   static const Duration autoLockTimeout = Duration.zero;
+
+  /// SharedPreferences key persisting the selected auto-lock timeout
+  /// (index into `AutoLockOption.values`). When unset, [autoLockTimeout]
+  /// above is the effective policy.
+  static const String autoLockTimeoutPrefsKey = 'kamui_auto_lock_timeout_index';
 
   // ─── UI Dimensions ────────────────────────────────────────────
   static const double vortexRingSizeLarge  = 160.0;

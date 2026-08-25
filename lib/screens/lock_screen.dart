@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -14,6 +16,11 @@ import 'chat_list_screen.dart';
 import 'decoy_feed_screen.dart';
 
 /// Cyberpunk Lock Screen supporting Biometrics, PIN Verification, and Duress Panic Mode.
+///
+/// Verification runs through the rate-limited [LockService.verifyPin]: after
+/// too many consecutive failures the keypad disables and a countdown shows
+/// the remaining lockout. The locked-out message is identical no matter what
+/// was typed, so it never reveals whether a candidate PIN is the duress PIN.
 class LockScreen extends StatefulWidget {
   const LockScreen({super.key});
 
@@ -28,10 +35,30 @@ class _LockScreenState extends State<LockScreen> {
   String _statusText   = 'AUTHENTICATION REQUIRED';
   bool   _isError      = false;
 
+  /// Remaining rate-limit lockout; > 0 disables the keypad.
+  Duration _lockoutRemaining = Duration.zero;
+  Timer?   _lockoutTicker;
+
+  bool get _isLockedOut => _lockoutRemaining > Duration.zero;
+
   @override
   void initState() {
     super.initState();
+    _checkLockout();
     _checkBiometrics();
+  }
+
+  @override
+  void dispose() {
+    _lockoutTicker?.cancel();
+    super.dispose();
+  }
+
+  /// Re-arms the lockout UI from persisted state — an app restart mid-lockout
+  /// must not bypass the window.
+  Future<void> _checkLockout() async {
+    final remaining = await _lockService.remainingLockout();
+    if (remaining > Duration.zero && mounted) _startLockoutTicker(remaining);
   }
 
   Future<void> _checkBiometrics() async {
@@ -50,6 +77,7 @@ class _LockScreenState extends State<LockScreen> {
   }
 
   void _onKeyPress(String key) {
+    if (_isLockedOut) return;
     if (_enteredPin.length >= 6) return;
     setState(() {
       _enteredPin += key;
@@ -76,23 +104,30 @@ class _LockScreenState extends State<LockScreen> {
       return;
     }
 
-    // 1. Check Primary PIN (PBKDF2 hash-then-compare).
-    if (await _lockService.isNormalPin(pin)) {
-      _grantAccess();
-      return;
-    }
+    // 1. Rate-limited verification (primary + duress slots). While locked
+    //    out nothing is verified and the response is type-agnostic.
+    final result = await _lockService.verifyPin(pin);
+    if (!mounted) return;
 
-    // 2. Check Duress PIN (Silent Panic Wipe!)
-    if (await _lockService.isDuressPin(pin)) {
-      await DatabaseService().nuke();
-      await CryptoService().init();
-      if (mounted) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const DecoyFeedScreen()),
-        );
-      }
-      return;
+    switch (result.status) {
+      case PinAttemptStatus.lockedOut:
+        _startLockoutTicker(result.lockoutRemaining);
+        return;
+      case PinAttemptStatus.duressUnlocked:
+        await DatabaseService().nuke();
+        await CryptoService().init();
+        if (mounted) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const DecoyFeedScreen()),
+          );
+        }
+        return;
+      case PinAttemptStatus.primaryUnlocked:
+        _grantAccess();
+        return;
+      case PinAttemptStatus.denied:
+        break;
     }
 
     // Defensive: shield not armed yet (e.g. TEST SHIELD preview before setup).
@@ -101,11 +136,38 @@ class _LockScreenState extends State<LockScreen> {
       return;
     }
 
-    // Invalid PIN
+    // Invalid PIN — generic feedback only.
     setState(() {
       _isError     = true;
       _statusText  = 'ACCESS DENIED — INVALID KEY';
       _enteredPin = '';
+    });
+  }
+
+  /// Disables the keypad and counts down [remaining] second by second.
+  void _startLockoutTicker(Duration remaining) {
+    _lockoutTicker?.cancel();
+    setState(() {
+      _lockoutRemaining = remaining;
+      _isError          = true;
+      _enteredPin       = '';
+    });
+    _lockoutTicker = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      final next = _lockoutRemaining - const Duration(seconds: 1);
+      if (next <= Duration.zero) {
+        timer.cancel();
+        setState(() {
+          _lockoutRemaining = Duration.zero;
+          _isError          = false;
+          _statusText       = 'AUTHENTICATION REQUIRED';
+        });
+      } else {
+        setState(() => _lockoutRemaining = next);
+      }
     });
   }
 
@@ -150,7 +212,10 @@ class _LockScreenState extends State<LockScreen> {
               ),
               const SizedBox(height: 10),
               Text(
-                _statusText,
+                _isLockedOut
+                    ? 'SHIELD LOCKED — RETRY IN '
+                        '${_lockoutRemaining.inSeconds}s'
+                    : _statusText,
                 style: GoogleFonts.jetBrainsMono(
                   fontSize: 10,
                   color:    _isError ? Colors.redAccent : cyberCyan.withAlpha(160),
@@ -164,6 +229,7 @@ class _LockScreenState extends State<LockScreen> {
                 onDigit:     _onKeyPress,
                 onBackspace: _onBackspace,
                 onBiometric: _canBiometric ? _authenticateBiometrics : null,
+                enabled:     !_isLockedOut,
               ),
               const SizedBox(height: 24),
             ],

@@ -2,11 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'core/constants.dart';
 import 'core/providers.dart';
 import 'core/theme.dart';
 import 'screens/lock_screen.dart';
 import 'screens/splash_screen.dart';
+import 'services/auto_lock_settings.dart';
 import 'services/crypto_service.dart';
 import 'services/lock_service.dart';
 import 'services/notification_service.dart';
@@ -72,17 +72,20 @@ class _KamuiAppState extends ConsumerState<KamuiApp>
     }
   }
 
-  /// Re-arms the lock gate when the app was backgrounded longer than
-  /// [KamuiConstants.autoLockTimeout]. No-op when the shield is not enabled.
-  void _lockIfExpired() {
+  /// Re-arms the lock gate when the app was backgrounded longer than the
+  /// user-configured auto-lock timeout (persisted via [AutoLockSettings];
+  /// falls back to [KamuiConstants.autoLockTimeout] when unset). Re-read on
+  /// every resume, so a changed setting applies live without a restart.
+  /// No-op when the shield is not enabled.
+  Future<void> _lockIfExpired() async {
     final backgroundedAt = _backgroundedAt;
     _backgroundedAt = null;
     if (backgroundedAt == null) return;
-    if (DateTime.now().difference(backgroundedAt) <
-        KamuiConstants.autoLockTimeout) {
+    final timeout = await AutoLockSettings.load();
+    if (DateTime.now().difference(backgroundedAt) < timeout) {
       return;
     }
-    _presentLockScreen();
+    await _presentLockScreen();
   }
 
   Future<void> _presentLockScreen() async {

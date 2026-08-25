@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:pointycastle/export.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// Service managing Biometric Authentication, Security PINs, and Duress Mode.
 ///
@@ -21,6 +22,18 @@ import 'package:pointycastle/export.dart';
 /// storage-dump extraction. Entries written by pre-Phase-3 builds (raw
 /// plaintext, no `$`-delimited marker) are transparently upgraded to the
 /// hashed format on their first successful verification.
+///
+/// ## Rate limiting (Phase 6)
+/// [verifyPin] is the rate-limited verification entry point used by the lock
+/// screen. After [maxConsecutiveFailures] consecutive failed attempts the
+/// service enters a lockout window starting at [initialLockout] and doubling
+/// with each subsequent lockout, capped at [maxLockout]. A successful unlock
+/// resets both the failure counter and the escalation counter. Lockout state
+/// (counters + lockout-until timestamp) persists in SharedPreferences — it is
+/// not secret data, only throttling metadata. During a lockout NO pin is
+/// verified at all (not even against the duress slot), so an attacker cannot
+/// learn whether any candidate PIN is the duress PIN: every attempt receives
+/// the identical locked-out response.
 class LockService {
   static final LockService _instance = LockService._internal();
   factory LockService() => _instance;
@@ -36,11 +49,36 @@ class LockService {
   static const String duressPinStorageKey = 'kamui_duress_pin';
   static const String enabledStorageKey   = 'kamui_lock_enabled';
 
+  // ─── Rate-limit storage keys (SharedPreferences — not secret data) ────────
+  /// Consecutive failed verification attempts since the last success.
+  static const String failedAttemptsKey = 'kamui_lock_failed_attempts';
+
+  /// Epoch-ms timestamp until which verification is locked out.
+  static const String lockoutUntilKey = 'kamui_lock_lockout_until_ms';
+
+  /// How many lockouts have fired since the last successful unlock
+  /// (drives the doubling escalation window).
+  static const String lockoutCountKey = 'kamui_lock_lockout_count';
+
+  // ─── Rate-limit policy ────────────────────────────────────────────────────
+  /// Failed attempts tolerated before the first lockout fires.
+  static const int maxConsecutiveFailures = 5;
+
+  /// Duration of the first lockout window; doubles per subsequent lockout.
+  static const Duration initialLockout = Duration(seconds: 30);
+
+  /// Hard cap for the escalating lockout window.
+  static const Duration maxLockout = Duration(minutes: 15);
+
   static const int _saltLengthBytes = 16;
   static const int _hashLengthBytes = 32; // 256-bit digest
 
   final LocalAuthentication _localAuth;
   final FlutterSecureStorage _storage;
+
+  /// Injectable clock so tests can fast-forward through lockout windows
+  /// without real delays.
+  final DateTime Function() _now;
 
   /// PBKDF2 rounds used when creating NEW hash records. Verification always
   /// honors the round count embedded in the stored record.
@@ -52,12 +90,14 @@ class LockService {
     FlutterSecureStorage? storage,
     LocalAuthentication? localAuth,
     int iterations = defaultIterations,
+    DateTime Function()? clock,
   })  : _storage = storage ??
             const FlutterSecureStorage(
               aOptions: AndroidOptions(encryptedSharedPreferences: true),
               iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
             ),
         _localAuth = localAuth ?? LocalAuthentication(),
+        _now = clock ?? DateTime.now,
         _iterations = iterations {
     if (iterations < 1) {
       throw ArgumentError.value(iterations, 'iterations', 'Must be >= 1');
@@ -71,8 +111,13 @@ class LockService {
   factory LockService.isolated({
     FlutterSecureStorage? storage,
     int iterations = 1000,
+    DateTime Function()? clock,
   }) {
-    return LockService._internal(storage: storage, iterations: iterations);
+    return LockService._internal(
+      storage: storage,
+      iterations: iterations,
+      clock: clock,
+    );
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -137,6 +182,8 @@ class LockService {
       await _storage.write(key: duressPinStorageKey, value: _hashPin(duressPin));
     }
     await _storage.write(key: enabledStorageKey, value: 'true');
+    // Fresh shield arm starts with a clean rate-limit slate.
+    await resetRateLimit();
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -170,6 +217,86 @@ class LockService {
     await _storage.delete(key: pinStorageKey);
     await _storage.delete(key: duressPinStorageKey);
     await _storage.write(key: enabledStorageKey, value: 'false');
+    // A disarmed shield must not inherit stale lockout state.
+    await resetRateLimit();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RATE LIMITING (Phase 6)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Rate-limited verification of one lock-screen submission.
+  ///
+  /// Contract:
+  ///   • While locked out, NO pin is verified — not even against the duress
+  ///     slot — so the response is identical regardless of what was typed and
+  ///     cannot reveal whether a candidate PIN is the duress PIN.
+  ///   • A primary-PIN match returns [PinAttemptStatus.primaryUnlocked] and
+  ///     resets the failure + escalation counters.
+  ///   • A duress-PIN match returns [PinAttemptStatus.duressUnlocked] and also
+  ///     resets the counters (the caller performs the panic wipe).
+  ///   • Anything else records one failure; reaching
+  ///     [maxConsecutiveFailures] starts a lockout window of [initialLockout]
+  ///     doubled per prior lockout, capped at [maxLockout].
+  Future<PinAttemptResult> verifyPin(String pin) async {
+    final remaining = await remainingLockout();
+    if (remaining > Duration.zero) {
+      return PinAttemptResult.lockedOut(remaining);
+    }
+    if (await isNormalPin(pin)) {
+      await resetRateLimit();
+      return const PinAttemptResult.primaryUnlocked();
+    }
+    if (await isDuressPin(pin)) {
+      await resetRateLimit();
+      return const PinAttemptResult.duressUnlocked();
+    }
+    return _recordFailedAttempt();
+  }
+
+  /// Remaining lockout time; [Duration.zero] when not locked out.
+  Future<Duration> remainingLockout() async {
+    final prefs = await SharedPreferences.getInstance();
+    final untilMs = prefs.getInt(lockoutUntilKey);
+    if (untilMs == null) return Duration.zero;
+    final remaining =
+        DateTime.fromMillisecondsSinceEpoch(untilMs).difference(_now());
+    return remaining.isNegative ? Duration.zero : remaining;
+  }
+
+  /// Convenience predicate over [remainingLockout].
+  Future<bool> isLockedOut() async =>
+      (await remainingLockout()) > Duration.zero;
+
+  /// Clears failure/escalation counters and any pending lockout timestamp.
+  Future<void> resetRateLimit() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(failedAttemptsKey, 0);
+    await prefs.setInt(lockoutCountKey, 0);
+    await prefs.remove(lockoutUntilKey);
+  }
+
+  /// Records one failed attempt and arms a lockout when the threshold is hit.
+  Future<PinAttemptResult> _recordFailedAttempt() async {
+    final prefs = await SharedPreferences.getInstance();
+    final failures = (prefs.getInt(failedAttemptsKey) ?? 0) + 1;
+    await prefs.setInt(failedAttemptsKey, failures);
+    if (failures < maxConsecutiveFailures) {
+      return const PinAttemptResult.denied();
+    }
+
+    final lockouts = (prefs.getInt(lockoutCountKey) ?? 0) + 1;
+    await prefs.setInt(lockoutCountKey, lockouts);
+
+    // initialLockout * 2^(lockouts-1), capped. The exponent clamp keeps the
+    // shift in safe integer territory before the cap comparison runs.
+    final exponent = min(lockouts - 1, 32);
+    var window = initialLockout * (1 << exponent);
+    if (window > maxLockout) window = maxLockout;
+
+    final until = _now().add(window);
+    await prefs.setInt(lockoutUntilKey, until.millisecondsSinceEpoch);
+    return PinAttemptResult.lockedOut(window);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -275,4 +402,46 @@ class LockService {
       throw ArgumentError('$paramName must be 4–6 digits');
     }
   }
+}
+
+/// Outcome of one rate-limited lock-screen verification attempt.
+enum PinAttemptStatus {
+  /// Primary PIN matched — grant access.
+  primaryUnlocked,
+
+  /// Duress PIN matched — caller performs the silent panic wipe.
+  duressUnlocked,
+
+  /// No slot matched and no lockout is active — generic failure only.
+  denied,
+
+  /// Rate limiter active — nothing was verified; identical response
+  /// regardless of the submitted value.
+  lockedOut,
+}
+
+/// Immutable result of [LockService.verifyPin].
+class PinAttemptResult {
+  const PinAttemptResult.primaryUnlocked()
+      : this._(PinAttemptStatus.primaryUnlocked);
+  const PinAttemptResult.duressUnlocked()
+      : this._(PinAttemptStatus.duressUnlocked);
+  const PinAttemptResult.denied() : this._(PinAttemptStatus.denied);
+
+  /// [lockoutRemaining] is the window that was just armed or is still running.
+  const PinAttemptResult.lockedOut(Duration lockoutRemaining)
+      : this._(PinAttemptStatus.lockedOut, lockoutRemaining);
+
+  const PinAttemptResult._(this.status,
+      [this.lockoutRemaining = Duration.zero]);
+
+  final PinAttemptStatus status;
+
+  /// Meaningful when [status] is [PinAttemptStatus.lockedOut]; Duration.zero
+  /// otherwise.
+  final Duration lockoutRemaining;
+
+  bool get unlocked =>
+      status == PinAttemptStatus.primaryUnlocked ||
+      status == PinAttemptStatus.duressUnlocked;
 }
